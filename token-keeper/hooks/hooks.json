@@ -1,0 +1,4 @@
+{
+  "description": "Token Keeper hooks module",
+  "modules": ["./register.mjs"]
+}

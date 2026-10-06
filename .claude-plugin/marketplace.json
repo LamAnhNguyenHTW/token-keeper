@@ -1,0 +1,14 @@
+{
+  "name": "token-keeper",
+  "description": "Token economics mods for Claude Code, based on Nate Herk's Cache Keeper",
+  "owner": {
+    "name": "Lam Anh Nguyen"
+  },
+  "plugins": [
+    {
+      "name": "token-keeper",
+      "source": "./token-keeper",
+      "description": "Shows what a chat's prompt cache costs, keeps it warm while that pays off, warns before a cold restart, and hands a big chat off to a fresh one"
+    }
+  ]
+}

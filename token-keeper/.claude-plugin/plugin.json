@@ -1,0 +1,9 @@
+{
+  "name": "token-keeper",
+  "version": "1.0.0",
+  "description": "Cache Keeper by Nate Herk, cut down to token economics: cache stats, a dollar-based cold-send guard, keep warm with a break-even, and handoff",
+  "author": {
+    "name": "Lam Anh Nguyen"
+  },
+  "license": "MIT"
+}
