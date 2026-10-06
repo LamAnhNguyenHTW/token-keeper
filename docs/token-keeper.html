@@ -1,0 +1,311 @@
+<title>Token Keeper</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@500..700&family=Inter:wght@400..600&family=JetBrains+Mono:wght@400..600&display=swap">
+<style>
+/* Layout: one reading column, a terminal-style band as the hero, a cost calculator in the middle */
+:root {
+  --bg: #0a0a0b; --panel: #151417; --line: #29282d; --fg: #f6f4f1; --muted: #9b99a1;
+  --accent: #cc6f4e; --warm: #4caf6d; --cool: #d9a441; --cold: #5b8def;
+  --display: 'Instrument Sans', 'Segoe UI', Arial, sans-serif;
+  --body: 'Inter', 'Segoe UI', Arial, sans-serif;
+  --mono: 'JetBrains Mono', Consolas, 'Courier New', monospace;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) {
+  --bg: #f7f5f2; --panel: #ffffff; --line: #e2dfda; --fg: #1b1a1d; --muted: #5f5d66;
+  --accent: #b2562f; --warm: #2f7d4a; --cool: #9a6b0f; --cold: #3361c2; color-scheme: light } }
+:root[data-theme="light"] {
+  --bg: #f7f5f2; --panel: #ffffff; --line: #e2dfda; --fg: #1b1a1d; --muted: #5f5d66;
+  --accent: #b2562f; --warm: #2f7d4a; --cool: #9a6b0f; --cold: #3361c2; color-scheme: light }
+
+* { box-sizing: border-box }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 var(--body); padding-inline: 20px }
+.wrap { max-width: 920px; margin: 0 auto; padding-block: 56px 80px; display: flex; flex-direction: column; gap: 72px }
+h1, h2, h3 { font-family: var(--display); line-height: 1.15; margin: 0; text-wrap: balance }
+h1 { font-size: clamp(40px, 7vw, 64px); font-weight: 700 }
+h2 { font-size: clamp(26px, 4vw, 34px); font-weight: 700 }
+h3 { font-size: 19px; font-weight: 600 }
+p { margin: 0; max-width: 65ch }
+.eyebrow { font-size: 13px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--accent) }
+.muted { color: var(--muted) }
+section { display: flex; flex-direction: column; gap: 20px }
+code, .mono { font-family: var(--mono); font-size: .92em }
+a { color: var(--accent) }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
+
+/* hero */
+.hero { gap: 24px }
+.lede { font-size: 20px; color: var(--muted); max-width: 52ch }
+.band { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 20px; font: 14px/1.7 var(--mono); color: var(--muted); overflow-x: auto; white-space: pre }
+.band .w { color: var(--warm) } .band .a { color: var(--accent) } .band .m { color: var(--cold) }
+.install { display: flex; flex-direction: column; gap: 8px }
+.cmd { display: flex; align-items: center; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px 10px 16px; min-width: 0 }
+.cmd code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap }
+.copy { font: 600 13px var(--body); color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; cursor: pointer }
+.copy:hover { border-color: var(--accent) }
+.meta { font-size: 14px; color: var(--muted) }
+
+/* numbers */
+.nums { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px }
+.num { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; display: flex; flex-direction: column; gap: 4px }
+.num b { font: 700 32px var(--display); font-variant-numeric: tabular-nums }
+.num span { font-size: 14px; color: var(--muted) }
+@media (max-width: 640px) { .nums { grid-template-columns: 1fr } }
+
+/* feature groups */
+.groups { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 28px }
+.group { display: flex; flex-direction: column; gap: 10px; min-width: 0 }
+.group h3 { padding-bottom: 8px; border-bottom: 2px solid var(--line) }
+.group ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 8px; color: var(--muted) }
+.group li b { color: var(--fg); font-weight: 600 }
+.new { font: 600 11px var(--body); letter-spacing: .08em; text-transform: uppercase; color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0 5px; margin-left: 4px; vertical-align: 2px }
+@media (max-width: 760px) { .groups { grid-template-columns: 1fr } }
+
+/* calculator */
+.calc { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 24px; display: flex; flex-direction: column; gap: 22px }
+.controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 28px }
+.ctl { display: flex; flex-direction: column; gap: 6px; min-width: 0 }
+.ctl label { font-size: 14px; font-weight: 600; display: flex; justify-content: space-between; gap: 8px }
+.ctl output { font-family: var(--mono); color: var(--accent); font-variant-numeric: tabular-nums }
+.ctl input[type=range] { width: 100%; accent-color: var(--accent) }
+.seg { display: flex; flex-wrap: wrap; gap: 6px }
+.seg button { font: 500 14px var(--body); color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer }
+.seg button[aria-pressed="true"] { color: var(--fg); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent) }
+@media (max-width: 640px) { .controls { grid-template-columns: 1fr } }
+.options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px }
+.opt { border: 1px solid var(--line); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 6px; min-width: 0 }
+.opt.best { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, transparent) }
+.opt .cost { font: 700 28px var(--display); font-variant-numeric: tabular-nums }
+.opt .tag { font: 600 12px var(--body); letter-spacing: .08em; text-transform: uppercase; color: var(--muted) }
+.opt.best .tag { color: var(--accent) }
+.opt p { font-size: 14px; color: var(--muted) }
+@media (max-width: 640px) { .options { grid-template-columns: 1fr } }
+.verdict { font-size: 17px }
+.verdict b { color: var(--accent) }
+
+/* tables */
+.tbl { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px }
+table { border-collapse: collapse; width: 100%; font-size: 15px }
+th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--line); vertical-align: top }
+tr:last-child td { border-bottom: none }
+th { font-size: 13px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); background: var(--panel) }
+td:first-child { white-space: nowrap; font-family: var(--mono); font-size: 14px; color: var(--accent) }
+
+/* steps */
+.steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 14px; counter-reset: s }
+.steps li { counter-increment: s; display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 12px; align-items: start }
+.steps li::before { content: counter(s); font: 700 15px var(--mono); color: var(--accent); border: 1px solid var(--line); border-radius: 50%; width: 32px; height: 32px; display: grid; place-items: center }
+.steps b { font-weight: 600 }
+.steps p { color: var(--muted) }
+.notice { font: 14px/1.6 var(--mono); color: var(--muted); background: var(--panel); border-left: 3px solid var(--accent); padding: 12px 16px; border-radius: 0 8px 8px 0 }
+footer { font-size: 14px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 24px; display: flex; flex-direction: column; gap: 6px }
+@media (prefers-reduced-motion: no-preference) { .opt { transition: border-color .2s, background-color .2s } }
+</style>
+
+<div class="wrap">
+
+<header class="hero section">
+  <p class="eyebrow">Claude Code mod · v1.1.0</p>
+  <h1>Token Keeper</h1>
+  <p class="lede">Shows what your prompt cache costs, keeps it warm while that pays off, and hands a big chat off to a fresh one before it gets slow and expensive.</p>
+  <div class="band" aria-label="Example of the Token Keeper band above the prompt"><span class="w">● cache warm 57m</span> │ ctx 72k/1M 7% │ rewrite ≈ $0.57 │ 5h 63% · week 58%   <span class="a">[ handoff ]</span>
+<span class="m">Opus 5.5</span> · high │ session $0.57 · today $3.20</div>
+  <div class="install">
+    <div class="cmd"><code id="c1">claude plugin marketplace add LamAnhNguyenHTW/token-keeper</code><button class="copy" type="button" data-copy="c1">Copy</button></div>
+    <div class="cmd"><code id="c2">claude plugin install token-keeper@token-keeper</code><button class="copy" type="button" data-copy="c2">Copy</button></div>
+  </div>
+  <p class="meta">Needs Claude Code 2.1.287 or later with mods turned on. Don't install it next to Cache Keeper: both register <code>/cache</code>, <code>/keepwarm</code> and <code>/handoff</code>.</p>
+</header>
+
+<section>
+  <p class="eyebrow">Why</p>
+  <h2>Every message re-reads the whole chat</h2>
+  <p>While the prompt cache is warm, that read is cheap. After a pause longer than the cache window (5 minutes on the API default, 1 hour on a subscription) the next message writes the whole context again at full price. Claude Code caches by itself; it just doesn't tell you when the cache goes cold or what the next message will cost.</p>
+  <div class="nums">
+    <div class="num"><b>$0.20</b><span>per million tokens, read from a warm cache (Opus 5.5)</span></div>
+    <div class="num"><b>$8.00</b><span>per million tokens, written again after a 1h cache went cold</span></div>
+    <div class="num"><b>40×</b><span>the difference, for the same context, after every long pause</span></div>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow">What it does</p>
+  <h2>Three jobs</h2>
+  <div class="groups">
+    <div class="group">
+      <h3>See what's happening</h3>
+      <ul>
+        <li><b>The band</b> above the prompt: cache state, context size, what a rewrite costs now, session and today's cost, plan limits.</li>
+        <li><b>/cache</b>: the full status and every setting.</li>
+        <li><b>TTL detection</b>: measures whether you run on the 5-minute or 1-hour cache.</li>
+        <li><b>Cache-break alert</b>: names the cause when a warm cache is rewritten (model switch, changed CLAUDE.md, MCP tools, settings).</li>
+      </ul>
+    </div>
+    <div class="group">
+      <h3>Avoid cold restarts</h3>
+      <ul>
+        <li><b>Cooling warning</b> shortly before a big cache goes cold.</li>
+        <li><b>/keepwarm</b>: small pings keep the cache alive, and it warns past the point where a rewrite is cheaper.</li>
+        <li><b>Cold-send guard</b>: before you send into a big cold context, it asks: send, compact first, or cancel.</li>
+      </ul>
+    </div>
+    <div class="group">
+      <h3>Keep the context small</h3>
+      <ul>
+        <li><b>/handoff</b>: Claude writes a summary, saves it, clears the chat and carries on in a fresh one.</li>
+        <li><b>Handoff vs keep-warm</b><span class="new">new</span>: /keepwarm says when a handoff is cheaper, and what every later turn saves.</li>
+        <li><b>140k reminder</b><span class="new">new</span>: past 140k tokens it suggests a handoff and asks again every 100k.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section aria-labelledby="calc-h">
+  <p class="eyebrow">Try it</p>
+  <h2 id="calc-h">Pause coming up: ping, hand off, or let it go cold?</h2>
+  <p class="muted">The same math Token Keeper runs, at API list prices. It counts only the pause; a handoff also makes every later turn cheaper.</p>
+  <div class="calc">
+    <div class="controls">
+      <div class="ctl">
+        <label id="m-l">Model</label>
+        <div class="seg" role="group" aria-labelledby="m-l" id="model">
+          <button type="button" data-v="opus" aria-pressed="true">Opus 5.5</button>
+          <button type="button" data-v="sonnet" aria-pressed="false">Sonnet 5.5</button>
+          <button type="button" data-v="haiku" aria-pressed="false">Haiku 4.5</button>
+          <button type="button" data-v="fable" aria-pressed="false">Fable 5.1</button>
+        </div>
+      </div>
+      <div class="ctl">
+        <label id="t-l">Cache window</label>
+        <div class="seg" role="group" aria-labelledby="t-l" id="ttl">
+          <button type="button" data-v="5" aria-pressed="true">5 minutes</button>
+          <button type="button" data-v="60" aria-pressed="false">1 hour</button>
+        </div>
+      </div>
+      <div class="ctl">
+        <label for="ctx">Context size <output id="ctx-o" for="ctx">300k</output></label>
+        <input type="range" id="ctx" min="20" max="1000" step="10" value="300">
+      </div>
+      <div class="ctl">
+        <label for="pause">Pause <output id="pause-o" for="pause">30m</output></label>
+        <input type="range" id="pause" min="5" max="240" step="5" value="30">
+      </div>
+    </div>
+    <div class="options" aria-live="polite">
+      <div class="opt" id="o-kw"><span class="tag">Keep warm</span><span class="cost" id="kw">$0</span><p id="kw-d"></p></div>
+      <div class="opt" id="o-ho"><span class="tag">Handoff now</span><span class="cost" id="ho">$0</span><p id="ho-d"></p></div>
+      <div class="opt" id="o-cd"><span class="tag">Let it go cold</span><span class="cost" id="cd">$0</span><p id="cd-d"></p></div>
+    </div>
+    <p class="verdict" id="verdict"></p>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow">How to use it</p>
+  <h2>A typical session</h2>
+  <ol class="steps">
+    <li><div><b>Work as usual.</b><p>The band shows the cache warm, cooling or cold and what a rewrite would cost right now.</p></div></li>
+    <li><div><b>Before a short break, type <code>/keepwarm</code>.</b><p>30 minutes by default on the 5-minute cache, 4 hours on the 1-hour cache. If a handoff would be cheaper, it says so with both prices.</p></div></li>
+    <li><div><b>Before a long break, or when you're done, type <code>/handoff</code> while the cache is warm.</b><p>On a cold cache the handoff would have to rewrite everything too. When the summary is in, press <code>c</code> on the band or type <code>/handoff continue</code> to clear and carry on.</p></div></li>
+    <li><div><b>When the chat grows past 140k, decide.</b><p>Token Keeper shows a notice and asks:</p>
+      <p class="notice">ℹ️ This chat is at 140k tokens, and a long context gets less reliable. A /handoff or /compact (about $0.19, either) carries on in a fresh chat, and every turn after it re-reads about 23k instead of 140k: $0.02 less per turn.<br><br>❯ Handoff now · Remind me after another 100k (240k) · No more reminders</p></div></li>
+  </ol>
+</section>
+
+<section>
+  <p class="eyebrow">Reference</p>
+  <h2>Commands and settings</h2>
+  <div class="tbl"><table>
+    <tr><th>Command</th><th>What it does</th></tr>
+    <tr><td>/cache</td><td>Status: cache state, costs, cold restarts, cache breaks, handoff cost, settings</td></tr>
+    <tr><td>/cache ttl 5|60|auto</td><td>Cache window. <code>auto</code> measures it</td></tr>
+    <tr><td>/cache guard on|off</td><td>Ask before a cold send of a big context</td></tr>
+    <tr><td>/cache big $1|default</td><td>When a context counts as big: what a rewrite costs. $1 by default, shown in tokens for your model</td></tr>
+    <tr><td>/cache handoff 140k|off|default</td><td>Suggest a handoff past this size, then every 100k more. 140k by default</td></tr>
+    <tr><td>/cache alerts on|off</td><td>Warnings and notices in the chat</td></tr>
+    <tr><td>/keepwarm [30m|4h|off]</td><td>Keep the cache warm for this long</td></tr>
+    <tr><td>/handoff [continue]</td><td>Write a handoff; <code>continue</code> clears the chat and carries on with it</td></tr>
+  </table></div>
+  <p class="muted">If another plugin already took a name, Token Keeper registers <code>/tk-cache</code>, <code>/tk-keepwarm</code> and <code>/tk-handoff</code> instead.</p>
+</section>
+
+<section>
+  <p class="eyebrow">How the numbers work</p>
+  <h2>Where the figures come from</h2>
+  <div class="groups">
+    <div class="group"><h3>A ping</h3><p class="muted">One cache read of the whole context, sent every 3.5 minutes on the 5-minute cache and every 52 minutes on the 1-hour cache. It never lands in your chat.</p></div>
+    <div class="group"><h3>The break-even</h3><p class="muted">A rewrite costs as much as (write price ÷ read price) pings, whatever the context size. On Opus 5.5 with the 5-minute cache that is about 1h 28m of pinging.</p></div>
+    <div class="group"><h3>A handoff</h3><p class="muted">One read of the context, the handoff text (the average of your last five), and the fresh chat's start, measured from /context. Files the fresh chat reads again are not counted.</p></div>
+  </div>
+</section>
+
+<footer>
+  <p>Everything stays on your machine, under <code>~/.claude/mods-data/token-keeper/</code>. The only extra requests are the keep-warm pings, and only while <code>/keepwarm</code> is on.</p>
+  <p>Based on Cache Keeper by Nate Herk (MIT). Prices are API list prices; on a subscription they stand for plan-limit use.</p>
+</footer>
+</div>
+
+<script>
+// Dollars per million tokens, as in token-keeper/hooks/pricing.mjs
+var PRICES = { opus: { input: 4, output: 20, read: 0.2 }, sonnet: { input: 2, output: 10, read: 0.2 }, haiku: { input: 1, output: 5, read: 0.1 }, fable: { input: 10, output: 50, read: 0.25 } }
+var HANDOFF_OUT = 3000, FRESH_START = 20000
+var state = { model: 'opus', ttl: 5 }
+
+function usd(n) { return n < 0.1 ? '$' + n.toFixed(3).replace(/0$/, '') : '$' + n.toFixed(2) }
+function tok(n) { return n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M' : Math.round(n / 1e3) + 'k' }
+function mins(m) { var h = Math.floor(m / 60), r = Math.round(m % 60); return h ? h + 'h' + (r ? ' ' + r + 'm' : '') : r + 'm' }
+
+function render() {
+  var p = PRICES[state.model], ttl = state.ttl
+  var ctx = +document.getElementById('ctx').value * 1000
+  var pause = +document.getElementById('pause').value
+  var write = p.input * (ttl >= 60 ? 2 : 1.25)
+  var every = ttl >= 60 ? 52 : 3.5
+  var ping = ctx * p.read / 1e6
+  var pings = Math.floor(pause / every)
+  var kw = pings * ping
+  var cold = pause < ttl ? 0 : ctx * write / 1e6
+  var fresh = FRESH_START + HANDOFF_OUT
+  var ho = ping + HANDOFF_OUT * p.output / 1e6 + FRESH_START * write / 1e6
+  var perTurn = Math.max(0, ctx - fresh) * p.read / 1e6
+
+  document.getElementById('ctx-o').textContent = tok(ctx)
+  document.getElementById('pause-o').textContent = mins(pause)
+  document.getElementById('kw').textContent = usd(kw)
+  document.getElementById('kw-d').textContent = pings + ' ping' + (pings === 1 ? '' : 's') + ' of ' + usd(ping) + ', one every ' + (ttl >= 60 ? '52 min' : '3.5 min') + '.'
+  document.getElementById('ho').textContent = usd(ho)
+  document.getElementById('ho-d').textContent = 'Then each turn re-reads ~' + tok(fresh) + ' instead of ' + tok(ctx) + ': ' + usd(perTurn) + ' less per turn.'
+  document.getElementById('cd').textContent = usd(cold)
+  document.getElementById('cd-d').textContent = pause < ttl ? 'The pause is shorter than the cache window: nothing to pay.' : 'The next message writes all ' + tok(ctx) + ' again.'
+
+  var opts = [['o-kw', kw, 'keep it warm'], ['o-ho', ho, 'hand off now'], ['o-cd', cold, 'let it go cold']]
+  var best = opts.reduce(function (a, b) { return b[1] < a[1] ? b : a })
+  opts.forEach(function (o) { document.getElementById(o[0]).classList.toggle('best', o === best) })
+  var v = document.getElementById('verdict')
+  if (cold === 0) v.innerHTML = 'The cache outlives this pause. Nothing to do.'
+  else v.innerHTML = 'Cheapest for this pause: <b>' + best[2] + '</b>' + (best[0] !== 'o-ho' && perTurn > 0.01 ? '. A handoff would still save ' + usd(perTurn) + ' on every turn after it.' : '.')
+}
+
+function seg(id, key, parse) {
+  var el = document.getElementById(id)
+  el.addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return
+    el.querySelectorAll('button').forEach(function (x) { x.setAttribute('aria-pressed', String(x === b)) })
+    state[key] = parse(b.dataset.v); render()
+  })
+}
+seg('model', 'model', String)
+seg('ttl', 'ttl', Number)
+document.getElementById('ctx').addEventListener('input', render)
+document.getElementById('pause').addEventListener('input', render)
+
+document.querySelectorAll('.copy').forEach(function (b) {
+  b.addEventListener('click', function () {
+    var code = document.getElementById(b.dataset.copy)
+    var done = function () { b.textContent = 'Copied'; setTimeout(function () { b.textContent = 'Copy' }, 1500) }
+    var select = function () { var r = document.createRange(); r.selectNodeContents(code); var s = getSelection(); s.removeAllRanges(); s.addRange(r) }
+    try { navigator.clipboard.writeText(code.textContent).then(done, select) } catch (e) { select() }
+  })
+})
+render()
+</script>

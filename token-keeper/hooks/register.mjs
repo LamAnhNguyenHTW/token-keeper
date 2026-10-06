@@ -18,6 +18,16 @@ const MAX_READ = 4 * 1024 * 1024 // $.fs.read refuses larger files
 // The default cold-send threshold: below a rewrite of about $1 a dialog
 // bothers more than the rewrite costs (about 125k tokens on Opus 5.5, 1h TTL)
 const BIG_USD = 1
+// What a handoff costs besides one read of the context: its output, and a fresh
+// chat's start (system prompt, tools, memory files). Both are measured; these
+// stand in until they are
+const HANDOFF_OUT = 3000
+const FRESH_START = 20000
+// The default context size from which a handoff is suggested (a rule of thumb:
+// past about 140k a model loses track more often), and how much more the
+// context grows before the next reminder
+const HANDOFF_AT = 140000
+const HANDOFF_STEP = 100000
 
 // This session
 const S = {
@@ -30,6 +40,8 @@ const S = {
   costUsd: 0,
   ttlMin: 60,
   ttlSource: 'default',
+  ttlWritten: 0, // the TTL of the last main-loop cache write, in minutes (0: none since /cache ttl)
+  ttlWarned: false, // said once that Claude Code does not write the TTL /cache ttl set
   coldRestarts: [],
   working: false,
   turnId: '', // the main loop's running (or last) turn
@@ -37,21 +49,27 @@ const S = {
   keepWarmUntil: 0,
   pings: 0,
   pingUsd: 0,
+  pingsSinceTurn: 0, // keep-warm pings since the last main-loop request
   rateLimits: [],
   cacheBreaks: [], // rewrites while the cache was still warm
   effort: '',
   todayUsd: null, // every session's spend since local midnight
   todayPartial: false, // a transcript was too big to read, so todayUsd is a lower bound
+  startTokens: 0, // what a fresh chat starts with, as /context counts it (0: not measured)
+  handoffOuts: [], // output tokens of the last few handoffs, kept across sessions
+  handoffNextAt: 0, // the size of the next handoff reminder (0: /cache handoff)
 }
 
-const settings = { bigUsd: BIG_USD, guard: true, ttlMin: 0, alerts: true }
+const settings = { bigUsd: BIG_USD, guard: true, ttlMin: 0, alerts: true, handoffAt: HANDOFF_AT }
 const names = { cache: 'cache', keepwarm: 'keepwarm', handoff: 'handoff' }
 
 let now = 0
 let home = ''
 let warnedFor = 0 // the lastActivity the cooling warning was shown for
 let justCompacted = false
+let ttlSwitched = false // /cache ttl changed while the cache was warm: the next request rewrites
 let handoffPending = false
+let envPrior // CLAUDE_CODE_PROMPT_CACHE_TTL before /cache ttl set it
 
 // The handoff flow. When /session-handoff runs (the band's button, /handoff, a
 // typed command, or Claude calling the skill), the answer of the turn it starts
@@ -60,6 +78,7 @@ let handoffPending = false
 const HANDOFF_SKILL = /(^|:)session-handoff$/
 const H = {
   armed: false,
+  outTokens: 0, // output of the handoff turn so far
   notTurn: '', // a turn already running when the handoff was queued: not the handoff's
   askAfter: false, // /handoff asks "clear and continue?" once the handoff is in
   text: '',
@@ -69,6 +88,7 @@ const H = {
 
 function armHandoff(insideTurn) {
   H.armed = true
+  H.outTokens = 0
   H.notTurn = insideTurn ? '' : S.working ? S.turnId : ''
 }
 
@@ -107,6 +127,10 @@ async function captureHandoff($, e) {
     return
   }
   H.text = body
+  if (H.outTokens > 0) {
+    S.handoffOuts = [...S.handoffOuts, H.outTokens].slice(-5)
+    await $.store.set('handoffOuts', S.handoffOuts).catch(() => {})
+  }
   try {
     H.path = await saveHandoff($, body)
   } catch {
@@ -206,8 +230,49 @@ async function runHandoff($) {
   }
 }
 
+// What the cache really uses: the last write's TTL, else /cache ttl, else the estimate
 function ttlMin() {
-  return settings.ttlMin || S.ttlMin
+  return S.ttlWritten || settings.ttlMin || S.ttlMin
+}
+
+// The session's spend as Claude Code counts it, or null when it does not say
+async function sessionUsd($) {
+  try {
+    const cost = (await $.session.usage()).cost
+    return cost ? cost.usd : null
+  } catch {
+    return null
+  }
+}
+
+// The TTL a cache write used: the usage's 1h/5m split when it has one; else the
+// price that matches what Claude Code charged for the request, since its cost
+// counts the TTL really written (0: too small to tell, or another request in between)
+function writeTtl(u, written, charged) {
+  if (u.cache_creation && written > 0) return (u.cache_creation.ephemeral_1h_input_tokens || 0) * 2 >= written ? 60 : 5
+  if (charged === null || written < 1000) return 0
+  const p5 = requestCost(u, u.model || S.model, 5)
+  const p60 = requestCost(u, u.model || S.model, 60)
+  const near = Math.abs(charged - p60) < Math.abs(charged - p5) ? 60 : 5
+  return Math.abs(charged - (near === 60 ? p60 : p5)) < Math.abs(p60 - p5) / 4 ? near : 0
+}
+
+function ttlEnv(min) {
+  return min === 5 ? '5m' : min === 60 ? '1h' : undefined
+}
+
+// Points Claude Code's own cache TTL at the /cache ttl choice; auto gives the
+// variable back as it was before Token Keeper set it
+async function applyTtl($) {
+  // a refusal must not break /cache: the next write's TTL check reports it
+  await $.env.set('CLAUDE_CODE_PROMPT_CACHE_TTL', settings.ttlMin ? ttlEnv(settings.ttlMin) : envPrior).catch(() => {})
+}
+
+function ttlSourceText() {
+  if (!settings.ttlMin) return S.ttlSource
+  if (!S.ttlWritten) return 'set by you'
+  if (S.ttlWritten === settings.ttlMin) return 'set by you · confirmed'
+  return `⚠️ you set ${settings.ttlMin} min, but Claude Code writes ${S.ttlWritten} min`
 }
 
 function ttlName(ttl) {
@@ -244,7 +309,10 @@ function cacheState() {
   if (left === null) return { kind: 'unknown', left: 0 }
   if (S.keepWarm) return { kind: 'kept', left }
   if (left <= 0) return { kind: 'cold', left }
-  if (left <= 5 * MIN) return { kind: 'cooling', left }
+  // Cooling: from when a keep-warm ping would go out (5 minutes before on the 1h
+  // TTL, 90s on the 5-minute one), so a 5-minute cache is not cooling right away
+  const ttl = ttlMin()
+  if (left <= Math.min(5 * MIN, ttl * MIN - pingEvery(ttl))) return { kind: 'cooling', left }
   return { kind: 'warm', left }
 }
 
@@ -284,6 +352,61 @@ function parseDuration(text) {
   return Math.min(24 * 60 * MIN, ms)
 }
 
+// "300k", "1.5M", "300000"
+function parseTokens(text) {
+  const m = String(text || '').match(/^(\d+(?:\.\d+)?)\s*(k|m)?$/)
+  if (!m || !(Number(m[1]) > 0)) return null
+  return Math.round(Number(m[1]) * (m[2] === 'k' ? 1e3 : m[2] === 'm' ? 1e6 : 1))
+}
+
+// What a fresh chat starts with: every /context row but the messages. A local
+// estimate, no request
+async function measureStart($) {
+  try {
+    const u = await $.session.usage({ breakdown: 'summary' })
+    const rows = (u.context && u.context.breakdown && u.context.breakdown.categories) || []
+    const sum = rows.filter((r) => r.kind === 'used' && r.name !== 'Messages').reduce((a, r) => a + (r.tokens || 0), 0)
+    if (sum > 0) S.startTokens = sum
+  } catch {
+    // no breakdown: keep the last figure or the default
+  }
+}
+
+// When the context passes the handoff size: a notice, then a choice to hand
+// off now, be reminded HANDOFF_STEP later, or turn the reminders off
+function handoffStep($) {
+  if (!settings.alerts || !settings.handoffAt) return
+  const at = S.handoffNextAt || settings.handoffAt
+  if (S.ctx < at) return
+  let next = at + HANDOFF_STEP
+  while (next <= S.ctx) next += HANDOFF_STEP
+  S.handoffNextAt = next
+  const c = keepWarmVsHandoff(0)
+  // Quality is the reason; the saving is named only when the fresh chat is clearly smaller
+  const saves = c.perTurn >= 0.01 ? `, and every turn after it re-reads about ${tokens(c.fresh)} instead of ${tokens(S.ctx)}: ${usd(c.perTurn)} less per turn` : ''
+  note($, `This chat is at ${tokens(S.ctx)} tokens, and a long context gets less reliable. A /${names.handoff} or /compact (about ${usd(c.handoff)}, either) carries on in a fresh chat${saves}.`)
+  // Off the hook: the turn is ending, and a dialog would hold it open
+  $.clock.after(300, () => offerHandoff($, next).catch(() => {}))
+}
+
+async function offerHandoff($, next) {
+  const remind = `Remind me after another ${tokens(HANDOFF_STEP)} (${tokens(next)})`
+  let answer = ''
+  try {
+    answer = await $.ui.ask(`This chat is at ${tokens(S.ctx)} tokens. Hand it off to a fresh chat?`, ['Handoff now', remind, 'No more reminders'])
+  } catch {
+    return // dismissed: remind at the next step
+  }
+  if (answer === 'Handoff now') {
+    H.askAfter = true
+    await runHandoff($)
+  } else if (answer === 'No more reminders') {
+    settings.handoffAt = 0
+    await $.store.set('settings', settings)
+    note($, `Handoff reminders off. /${names.cache} handoff default turns them back on.`)
+  }
+}
+
 function parseUsd(text) {
   const m = String(text || '').match(/^\$?(\d+(?:\.\d+)?)$/)
   return m && Number(m[1]) > 0 ? Number(m[1]) : null
@@ -303,8 +426,37 @@ function bolder(md) {
   return md ? (s) => `**${s}**` : (s) => s
 }
 
+// Keep warm for ms vs a handoff now, in dollars. A handoff reads the context
+// once, writes the handoff, and the fresh chat writes its start; then no pings
+// The handoff's output: the average of the last few, or the estimate
+function handoffOut() {
+  return S.handoffOuts.length ? S.handoffOuts.reduce((a, n) => a + n, 0) / S.handoffOuts.length : HANDOFF_OUT
+}
+
+// Keep warm for ms vs a handoff now, in dollars, and what each turn after the
+// handoff saves on re-reading the context (a /compact costs about the same)
+function keepWarmVsHandoff(ms) {
+  const ttl = ttlMin()
+  const p = priceFor(S.model)
+  const ping = S.ctx * p.read / 1e6
+  const start = S.startTokens || FRESH_START
+  const fresh = start + handoffOut()
+  return {
+    ping,
+    fresh,
+    keepWarm: Math.floor(ms / pingEvery(ttl)) * ping, // a ping every pingEvery, none at the start
+    handoff: ping + handoffOut() * p.output / 1e6 + start * writeRate(S.model, ttl) / 1e6,
+    perTurn: Math.max(0, S.ctx - fresh) * p.read / 1e6,
+  }
+}
+
 // Starts keeping the cache warm and says so, with ⚠️ past the break-even
 function startKeepWarm(ms, isDefault, md) {
+  // A new run counts its own pings; extending a running one keeps counting
+  if (!S.keepWarm) {
+    S.pings = 0
+    S.pingUsd = 0
+  }
   S.keepWarm = true
   S.keepWarmUntil = now + ms
   const b = bolder(md)
@@ -313,7 +465,9 @@ function startKeepWarm(ms, isDefault, md) {
   const how = `${b(minutes(ms))}${isDefault ? `, the default on the ${ttlName(ttl)}` : ''}, until ${clock(S.keepWarmUntil)}`
   const on = `On ${modelName(S.model)} with the ${ttlName(ttl)}`
   if (ms > be) return `⚠️ Keeping this cache warm for ${how}. ${on} that only pays off up to ${b('~' + minutes(be))}: after that, one rewrite (${usd(rewriteCost(S.ctx, S.model, ttl))}) is cheaper. Better: ${b(`/${names.keepwarm} ${ttl >= 60 ? '4h' : '30m'}`)} (the default), ${b('/' + names.handoff)} now while the cache is warm, or ${b('/clear')}.`
-  return `ℹ️ Keeping this cache warm for ${how}. ${on} it pays off up to ~${minutes(be)}.`
+  const c = keepWarmVsHandoff(ms)
+  const vs = c.handoff < c.keepWarm ? ` A ${b('/' + names.handoff)} now is cheaper: about ${usd(c.handoff)} vs ${usd(c.keepWarm)} for ${minutes(ms)} of pings. After it, each turn re-reads about ${tokens(c.fresh)} instead of ${tokens(S.ctx)}, about ${usd(c.perTurn)} less.` : ''
+  return `ℹ️ Keeping this cache warm for ${how}. ${on} it pays off up to ~${minutes(be)}.${vs}`
 }
 
 // Stops keeping the cache warm and says so ('' when it was off), ⚠️ for a problem
@@ -333,6 +487,9 @@ async function keepWarmStep($) {
   if (S.working || !S.lastActivity) return
   const ttl = ttlMin()
   if (now - S.lastActivity < pingEvery(ttl)) return
+  // Past the TTL the cache is gone (keep warm started late, or the machine slept):
+  // a ping would only write it again
+  if (now - S.lastActivity >= ttl * MIN) return log($, stopKeepWarm(`the cache already went cold ${minutes(now - S.lastActivity - ttl * MIN)} ago, so a ping would only write it again`, true))
   let reply = null
   try {
     reply = await $.model.fork({ prompt: 'token-keeper keep-alive ping. Reply with only: ok' })
@@ -347,8 +504,12 @@ async function keepWarmStep($) {
   S.pings += 1
   S.pingUsd += cost
   addToday(cost)
-  // A ping that writes instead of reading did not hit the cache: stop paying for it
-  if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
+  // The first ping after a turn may write the turn's tail (its prefix ends after the
+  // reply, the main thread's entry before it); a later ping that writes much missed
+  // the cache: stop paying for it
+  const first = S.pingsSinceTurn === 0
+  S.pingsSinceTurn += 1
+  if (!first && (u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
     return log($, stopKeepWarm(`the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`, true))
   }
   S.lastActivity = now
@@ -492,7 +653,7 @@ function statusText() {
   const c = names.cache
   // Markdown, as a command's output draws: a bold label per line, the band's icons
   const lines = []
-  lines.push(`**Token Keeper** · ${tokens(S.ctx)} tokens in context on **${modelName(S.model)}** · cache window **${ttl} min** (${settings.ttlMin ? 'set by you' : S.ttlSource})`)
+  lines.push(`**Token Keeper** · ${tokens(S.ctx)} tokens in context on **${modelName(S.model)}** · cache window **${ttl} min** (${ttlSourceText()})`)
   lines.push('')
   if (st.kind === 'unknown') lines.push('- – **Cache:** no request yet this session, so its state is unknown')
   if (st.kind === 'warm') lines.push(`- ● **Cache:** warm for about **${minutes(st.left)}** more`)
@@ -506,8 +667,9 @@ function statusText() {
   if (S.cacheBreaks.length) restarts += ` · ⚠️ **Cache breaks:** ${S.cacheBreaks.length} (${usd(S.cacheBreaks.reduce((a, r) => a + r.usd, 0))}), last: ${S.cacheBreaks[S.cacheBreaks.length - 1].cause}`
   lines.push(restarts)
   lines.push(`- **Cold-send guard:** ${settings.guard ? 'on' : 'off'}, asks above **${bigText()}** · rewriting now ≈ ${usd(rewrite)}, ${isBig() ? 'above' : 'below'} that`)
+  lines.push(`- **Handoff hint:** ${settings.handoffAt ? `from **${tokens(settings.handoffAt)}** tokens${settings.handoffAt === HANDOFF_AT ? ' (default)' : ''}, then every ${tokens(HANDOFF_STEP)} more` : 'off'} · a handoff costs about **${usd(keepWarmVsHandoff(0).handoff)}** now (fresh chat ${tokens(S.startTokens || FRESH_START)}${S.startTokens ? '' : ' estimated'}, handoff ${tokens(handoffOut())}${S.handoffOuts.length ? `, average of the last ${S.handoffOuts.length}` : ' estimated'})`)
   lines.push(`- **Alerts:** ${settings.alerts ? 'on' : 'off'}`)
-  lines.push(`- **Settings:** \`/${c} ttl 5|60|auto\` · \`/${c} guard on|off\` · \`/${c} big $1|default\` · \`/${c} alerts on|off\``)
+  lines.push(`- **Settings:** \`/${c} ttl 5|60|auto\` · \`/${c} guard on|off\` · \`/${c} big $1|default\` · \`/${c} handoff 140k|off|default\` · \`/${c} alerts on|off\``)
   return lines.join('\n')
 }
 
@@ -534,7 +696,14 @@ export function register(on) {
     S.cwd = await $.session.cwd()
     S.model = await $.session.model()
     await loadSettings($)
-    names.cache = (await registerCommand($, 'cache', 'Token Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big $1|default] [alerts on|off]')) || names.cache
+    // Remember the variable as found, unless it is the value /cache ttl set (a reload)
+    const prior = await $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL')
+    envPrior = settings.ttlMin && prior === ttlEnv(settings.ttlMin) ? undefined : prior
+    if (settings.ttlMin) await applyTtl($)
+    const outs = await $.store.get('handoffOuts')
+    S.handoffOuts = Array.isArray(outs) ? outs.filter((n) => n > 0).slice(-5) : []
+    measureStart($).catch(() => {})
+    names.cache = (await registerCommand($, 'cache', 'Token Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big $1|default] [handoff 140k|off|default] [alerts on|off]')) || names.cache
     names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 30m on the 5-min TTL, 4h on the 1h TTL), or /keepwarm off', '[30m|4h|off]', true)) || names.keepwarm
     names.handoff = (await registerCommand($, 'handoff', 'Session handoff, then clear this chat and continue with it (/handoff continue)', '[continue]')) || names.handoff
     $.clock.every(TICK_EVERY, () => tick($).catch(() => {}))
@@ -607,6 +776,7 @@ export function register(on) {
   // cache or rewrite it?
   on('turn.step', async function* ($, e, next) {
     const startedAt = await $.clock.now()
+    const usdBefore = e.agentId ? null : await sessionUsd($)
     const result = yield* next(e)
     if (!result || !result.usage) return result
     const u = result.usage
@@ -615,20 +785,40 @@ export function register(on) {
     now = await $.clock.now()
     const total = totalInput(u)
     const written = u.cache_creation_input_tokens || 0
+    // Each write's TTL is the cache window, measured
+    const usdAfter = usdBefore === null ? null : await sessionUsd($)
+    const seen = writeTtl(u, written, usdAfter === null ? null : usdAfter - usdBefore)
+    if (seen) {
+      S.ttlWritten = seen
+      if (!settings.ttlMin) {
+        S.ttlMin = S.ttlWritten
+        S.ttlSource = 'measured'
+      } else if (S.ttlWritten !== settings.ttlMin && !S.ttlWarned) {
+        S.ttlWarned = true
+        if (settings.alerts) warn($, `You set the ${settings.ttlMin}-min cache TTL, but Claude Code still writes ${S.ttlWritten}-min entries. FORCE_PROMPT_CACHING_5M overrides it, and setting it needs Claude Code v2.1.242 or later.`)
+      }
+    }
     const gap = S.lastActivity ? startedAt - S.lastActivity : 0
     const prevModel = S.model
     S.model = u.model || S.model
     const afterCompact = justCompacted
     justCompacted = false
+    const afterTtlSwitch = ttlSwitched
+    ttlSwitched = false
     if (afterCompact) {
       // the first request after a compaction writes the new, shorter context: expected
+    } else if (afterTtlSwitch) {
+      // a /cache ttl switch while warm: the rewrite is expected, so say what it really cost
+      if (written > 0) note($, `Switching to the ${ttlName(ttlMin())} rewrote ${tokens(written)} tokens for about ${usd(rewriteCost(written, S.model, ttlMin()))}.`)
     } else if (S.lastActivity && total > 30000 && written / total > 0.5 && gap < 4.5 * MIN) {
       // Rewritten although the cache was still warm: something changed the prompt prefix
       const cause = prevModel && u.model && prevModel !== u.model ? `the model changed (${priceFor(prevModel).id} → ${priceFor(u.model).id})` : 'the prompt prefix changed (CLAUDE.md, MCP tools, settings, effort, or system prompt)'
       const cost = rewriteCost(written, S.model, ttlMin())
       S.cacheBreaks.push({ at: now, tokens: written, usd: cost, cause })
       if (settings.alerts) warn($, `Cache broken while warm: ${cause}. Rewrote ${tokens(written)} tokens for about ${usd(cost)}.`)
-    } else if (S.lastActivity && total > 30000 && written / total > 0.5) {
+    } else if (S.lastActivity && total > 30000 && (written / total > 0.5 || (gap >= ttlMin() * MIN && written / total > 0.2))) {
+      // Cold: most of it rewritten, or past the TTL with a big share rewritten (the system
+      // prompt part often stays warm through other sessions, so the share can stay small).
       // A rewrite after 5-60 idle minutes means this session runs on the 5-minute TTL
       if (!settings.ttlMin && gap > 5.5 * MIN && gap < S.ttlMin * MIN) {
         S.ttlMin = 5
@@ -642,8 +832,10 @@ export function register(on) {
         S.ttlSource = 'measured'
       }
     }
+    if (H.armed) H.outTokens += u.output_tokens || 0
     S.ctx = total
     S.lastActivity = now
+    S.pingsSinceTurn = 0
     if (e.effort) S.effort = String(e.effort)
     return result
   })
@@ -663,6 +855,7 @@ export function register(on) {
       // usage unavailable: keep the per-request figures
     }
     if (H.armed && e.turnId !== H.notTurn) await captureHandoff($, e)
+    else handoffStep($)
     $.ui.invalidate('ui.render')
     return r
   })
@@ -714,13 +907,37 @@ export function register(on) {
     now = await $.clock.now()
     const [key, value] = String(e.args || '').trim().toLowerCase().split(/\s+/)
     if (key === 'ttl') {
-      settings.ttlMin = value === '5' ? 5 : value === '60' ? 60 : 0
+      const want = value === '5' ? 5 : value === '60' ? 60 : 0
+      // While the cache is warm, the next request rewrites what was cached under
+      // the old TTL; once it is cold that rewrite happens anyway, so no question
+      const st = cacheState()
+      if (want && want !== ttlMin() && ['warm', 'cooling', 'kept'].includes(st.kind) && S.ctx > 30000) {
+        const cost = usd(rewriteCost(S.ctx, S.model, want))
+        const keep = `Keep the ${ttlName(ttlMin())}`
+        let answer = keep
+        try {
+          answer = await $.ui.ask(`The cache is warm. Switching to the ${ttlName(want)} makes your next message rewrite up to ${tokens(S.ctx)} tokens (about ${cost}). Once the cache is cold, switching costs nothing extra. Switch now?`, ['Switch now', keep])
+        } catch {
+          // dismissed, or nobody to ask: keep the TTL
+        }
+        if (answer !== 'Switch now') return { text: `Cache TTL unchanged: ${ttlName(ttlMin())}. Switching now would rewrite up to ${tokens(S.ctx)} tokens (about ${cost}); after the cache goes cold it is free.` }
+      }
+      if (want !== settings.ttlMin && ['warm', 'cooling', 'kept'].includes(st.kind)) ttlSwitched = true
+      settings.ttlMin = want
+      S.ttlWritten = 0
+      S.ttlWarned = false
+      await applyTtl($)
     } else if (key === 'guard' || key === 'alerts') {
       settings[key] = value !== 'off'
     } else if (key === 'big') {
       const n = value === 'default' ? BIG_USD : parseUsd(value)
       if (!n) return { text: `Usage: \`/${names.cache} big $1\` (a dollar amount), or \`/${names.cache} big default\`.` }
       settings.bigUsd = n
+    } else if (key === 'handoff') {
+      const n = value === 'default' ? HANDOFF_AT : value === 'off' ? 0 : parseTokens(value)
+      if (n === null) return { text: `Usage: \`/${names.cache} handoff 140k\` (a context size in tokens), \`off\`, or \`default\`.` }
+      settings.handoffAt = n
+      S.handoffNextAt = 0
     }
     if (key) {
       await $.store.set('settings', settings)
@@ -736,10 +953,12 @@ export function register(on) {
     if (arg === 'off' || (arg === '' && S.keepWarm)) {
       text = stopKeepWarm('turned off') || 'ℹ️ Keep warm is already off.'
     } else if (arg === '') {
+      await measureStart($)
       text = startKeepWarm(defaultKeepWarmMs(), true, true)
     } else {
       const ms = parseDuration(arg)
       if (!ms) return { text: `Usage: \`/${names.keepwarm} 30m\`, \`/${names.keepwarm} 4h\`, or \`/${names.keepwarm} off\`.` }
+      await measureStart($)
       text = startKeepWarm(ms, false, true)
     }
     $.ui.invalidate('ui.render')
