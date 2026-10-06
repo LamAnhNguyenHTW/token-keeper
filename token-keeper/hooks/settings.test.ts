@@ -52,7 +52,7 @@ test('/keepwarm offers a handoff when that is cheaper than the pings', async ($,
   // 300k read $0.06 + 3k handoff $0.06 + 30k fresh start $0.15 vs 9 pings of $0.06
   expect(r.text).toContain('A **/handoff** now is cheaper: about $0.27 vs $0.54 for 30m of pings. After it, each turn re-reads about 33.0k instead of 300k, about $0.05 less.')
   const shown = await $.command.run({ command: 'cache', args: '' })
-  expect(shown.text).toContain('**Handoff hint:** from **300k** tokens (default)')
+  expect(shown.text).toContain('**Handoff hint:** from **140k** tokens (default)')
   expect(shown.text).toContain('fresh chat 30.0k, handoff 3.0k estimated')
 })
 
@@ -61,7 +61,7 @@ test('/cache handoff takes a context size in tokens, or off', async ($, on) => {
   mock.clock(on, { now: Date.parse('2026-10-05T12:00:00Z') })
   expect((await $.command.run({ command: 'cache', args: 'handoff 500k' })).text).toContain('**Handoff hint:** from **500k** tokens, then every 100k more ·')
   expect((await $.command.run({ command: 'cache', args: 'handoff off' })).text).toContain('**Handoff hint:** off')
-  expect((await $.command.run({ command: 'cache', args: 'handoff $2' })).text).toContain('Usage: `/cache handoff 300k`')
+  expect((await $.command.run({ command: 'cache', args: 'handoff $2' })).text).toContain('Usage: `/cache handoff 140k`')
 })
 
 test('past the handoff size, a notice suggests /handoff, again 100k later', async ($, on) => {
@@ -80,7 +80,7 @@ test('past the handoff size, a notice suggests /handoff, again 100k later', asyn
   }
   const hint = logs.filter((l) => l.includes('This chat is at 310k tokens'))
   expect(hint.length).toBe(1)
-  expect(hint[0]).toContain('re-reads all of it ($0.06). A /handoff or /compact (about $0.28, either) carries on with about 23.0k: about $0.06 less per turn.')
+  expect(hint[0]).toContain('re-reads all of it ($0.06), and a long context gets less reliable. A /handoff or /compact (about $0.28, either) carries on with about 23.0k: about $0.06 less per turn.')
   // the next reminder comes 100k later
   ctx = 405000
   for await (const _ of $.turn.step({ turnId: 't3', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as any) as any) {}
