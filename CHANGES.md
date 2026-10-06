@@ -3,7 +3,7 @@
 ## 1.1.0 (2026-10-06)
 - `/keepwarm` says when a `/handoff` now is cheaper than the pings it would send, with both prices, and how much less each turn after it costs.
 - A handoff's cost is measured: the fresh chat's start from /context (system prompt, tools, MCP tools, memory files), and the average output of the last five handoffs.
-- Past `/cache handoff` tokens (300k by default, or off) a notice suggests `/handoff` or `/compact`, with what each turn would save, and asks: hand off now, remind me 100k later, or no more reminders.
+- Past `/cache handoff` tokens (300k by default, or off) a notice suggests `/handoff` or `/compact`, with what each turn would save, and asks: hand off now, remind me after another 100k, or no more reminders.
 - Fix: a new `/keepwarm` run counts its own pings; before, the count and cost carried over from earlier runs in the session.
 
 ## 1.0.0 (2026-10-06)

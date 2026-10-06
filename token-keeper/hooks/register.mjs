@@ -338,7 +338,7 @@ function handoffStep($) {
 }
 
 async function offerHandoff($, next) {
-  const remind = `Remind me at ${tokens(next)}`
+  const remind = `Remind me after another ${tokens(HANDOFF_STEP)} (${tokens(next)})`
   let answer = ''
   try {
     answer = await $.ui.ask(`This chat is at ${tokens(S.ctx)} tokens. Hand it off to a fresh chat?`, ['Handoff now', remind, 'No more reminders'])
