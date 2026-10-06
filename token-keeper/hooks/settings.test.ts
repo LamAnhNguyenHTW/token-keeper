@@ -255,3 +255,25 @@ test('a return past the TTL counts as a cold restart even when the system prompt
   for await (const _ of $.turn.step({ turnId: 't2', index: 0, model: 'claude-sonnet-5-5', messageCount: 1 } as any) as any) {}
   expect((await $.command.run({ command: 'cache', args: '' })).text).toContain('- **Cold restarts:** 1 (')
 })
+
+test('a big new tool result is no cache break, a lost prefix while warm is', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on, { now: Date.parse('2026-10-05T12:00:00Z') })
+  const logs: string[] = []
+  on('ui.log', (_$, e: any) => { logs.push(String(e.text ?? e)); return { value: {} } as any })
+  let usage: any = { model: 'claude-sonnet-5-5', input_tokens: 2, cache_read_input_tokens: 25000, cache_creation_input_tokens: 18000, output_tokens: 40 }
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], usage } as any
+  })
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-sonnet-5-5', messageCount: 1 } as any) as any) {}
+  // the same turn reads a big file: the whole previous context is read, 77k are new
+  await clock.advance(20 * 1000)
+  usage = { ...usage, cache_read_input_tokens: 43000, cache_creation_input_tokens: 77400 }
+  for await (const _ of $.turn.step({ turnId: 't1', index: 1, model: 'claude-sonnet-5-5', messageCount: 3 } as any) as any) {}
+  expect(logs.some((l) => l.includes('Cache broken'))).toBe(false)
+  // a minute later only the system prompt part is read: the prefix changed
+  await clock.advance(60 * 1000)
+  usage = { ...usage, cache_read_input_tokens: 25000, cache_creation_input_tokens: 96000 }
+  for await (const _ of $.turn.step({ turnId: 't2', index: 0, model: 'claude-sonnet-5-5', messageCount: 5 } as any) as any) {}
+  expect(logs.some((l) => l.includes('Cache broken while warm: the prompt prefix changed') && l.includes('Rewrote 95.4k tokens'))).toBe(true)
+})
