@@ -59,20 +59,21 @@ test('/keepwarm offers a handoff when that is cheaper than the pings', async ($,
 test('/cache handoff takes a context size in tokens, or off', async ($, on) => {
   mock.store(on)
   mock.clock(on, { now: Date.parse('2026-10-05T12:00:00Z') })
-  expect((await $.command.run({ command: 'cache', args: 'handoff 500k' })).text).toContain('**Handoff hint:** from **500k** tokens ·')
+  expect((await $.command.run({ command: 'cache', args: 'handoff 500k' })).text).toContain('**Handoff hint:** from **500k** tokens, then every 100k more ·')
   expect((await $.command.run({ command: 'cache', args: 'handoff off' })).text).toContain('**Handoff hint:** off')
   expect((await $.command.run({ command: 'cache', args: 'handoff $2' })).text).toContain('Usage: `/cache handoff 300k`')
 })
 
-test('past the handoff size, a notice suggests /handoff once', async ($, on) => {
+test('past the handoff size, a notice suggests /handoff, again 100k later', async ($, on) => {
   mock.store(on)
   mock.clock(on, { now: Date.parse('2026-10-05T12:00:00Z') })
   const logs: string[] = []
   on('ui.log', (_$, e: any) => { logs.push(String(e.text ?? e)); return { value: {} } as any })
-  on('turn.step', async function* (_$, e) {
-    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], usage: { model: 'claude-opus-5-5', input_tokens: 10, cache_read_input_tokens: 310000, cache_creation_input_tokens: 0, output_tokens: 100 } } as any
-  })
   on('turn.complete', () => ({ text: '' }) as any)
+  let ctx = 310000
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], usage: { model: 'claude-opus-5-5', input_tokens: 10, cache_read_input_tokens: ctx, cache_creation_input_tokens: 0, output_tokens: 100 } } as any
+  })
   for (const id of ['t1', 't2']) {
     for await (const _ of $.turn.step({ turnId: id, index: 0, model: 'claude-opus-5-5', messageCount: 1 } as any) as any) {}
     await $.turn.complete({ turnId: id, reason: 'answer', answer: 'ok' } as any)
@@ -80,4 +81,9 @@ test('past the handoff size, a notice suggests /handoff once', async ($, on) => 
   const hint = logs.filter((l) => l.includes('This chat is at 310k tokens'))
   expect(hint.length).toBe(1)
   expect(hint[0]).toContain('re-reads all of it ($0.06). A /handoff or /compact (about $0.28, either) carries on with about 23.0k: about $0.06 less per turn.')
+  // the next reminder comes 100k later
+  ctx = 405000
+  for await (const _ of $.turn.step({ turnId: 't3', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as any) as any) {}
+  await $.turn.complete({ turnId: 't3', reason: 'answer', answer: 'ok' } as any)
+  expect(logs.filter((l) => l.includes('This chat is at 405k tokens')).length).toBe(1)
 })

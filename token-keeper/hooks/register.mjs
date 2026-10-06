@@ -23,8 +23,10 @@ const BIG_USD = 1
 // stand in until they are
 const HANDOFF_OUT = 3000
 const FRESH_START = 20000
-// The default context size from which a handoff is suggested
+// The default context size from which a handoff is suggested, and how much
+// more the context grows before the next reminder
 const HANDOFF_AT = 300000
+const HANDOFF_STEP = 100000
 
 // This session
 const S = {
@@ -51,7 +53,7 @@ const S = {
   todayPartial: false, // a transcript was too big to read, so todayUsd is a lower bound
   startTokens: 0, // what a fresh chat starts with, as /context counts it (0: not measured)
   handoffOuts: [], // output tokens of the last few handoffs, kept across sessions
-  handoffNoted: false, // the size notice was shown this session
+  handoffNextAt: 0, // the size of the next handoff reminder (0: /cache handoff)
 }
 
 const settings = { bigUsd: BIG_USD, guard: true, ttlMin: 0, alerts: true, handoffAt: HANDOFF_AT }
@@ -320,12 +322,37 @@ async function measureStart($) {
   }
 }
 
-// Once per session, when the context passes the handoff size
+// When the context passes the handoff size: a notice, then a choice to hand
+// off now, be reminded HANDOFF_STEP later, or turn the reminders off
 function handoffStep($) {
-  if (!settings.alerts || !settings.handoffAt || S.handoffNoted || S.ctx < settings.handoffAt) return
-  S.handoffNoted = true
+  if (!settings.alerts || !settings.handoffAt) return
+  const at = S.handoffNextAt || settings.handoffAt
+  if (S.ctx < at) return
+  let next = at + HANDOFF_STEP
+  while (next <= S.ctx) next += HANDOFF_STEP
+  S.handoffNextAt = next
   const c = keepWarmVsHandoff(0)
   note($, `This chat is at ${tokens(S.ctx)} tokens, and every turn re-reads all of it (${usd(c.ping)}). A /${names.handoff} or /compact (about ${usd(c.handoff)}, either) carries on with about ${tokens(c.fresh)}: about ${usd(c.perTurn)} less per turn.`)
+  // Off the hook: the turn is ending, and a dialog would hold it open
+  $.clock.after(300, () => offerHandoff($, next).catch(() => {}))
+}
+
+async function offerHandoff($, next) {
+  const remind = `Remind me at ${tokens(next)}`
+  let answer = ''
+  try {
+    answer = await $.ui.ask(`This chat is at ${tokens(S.ctx)} tokens. Hand it off to a fresh chat?`, ['Handoff now', remind, 'No more reminders'])
+  } catch {
+    return // dismissed: remind at the next step
+  }
+  if (answer === 'Handoff now') {
+    H.askAfter = true
+    await runHandoff($)
+  } else if (answer === 'No more reminders') {
+    settings.handoffAt = 0
+    await $.store.set('settings', settings)
+    note($, `Handoff reminders off. /${names.cache} handoff 300k turns them back on.`)
+  }
 }
 
 function parseUsd(text) {
@@ -373,6 +400,11 @@ function keepWarmVsHandoff(ms) {
 
 // Starts keeping the cache warm and says so, with ⚠️ past the break-even
 function startKeepWarm(ms, isDefault, md) {
+  // A new run counts its own pings; extending a running one keeps counting
+  if (!S.keepWarm) {
+    S.pings = 0
+    S.pingUsd = 0
+  }
   S.keepWarm = true
   S.keepWarmUntil = now + ms
   const b = bolder(md)
@@ -576,7 +608,7 @@ function statusText() {
   if (S.cacheBreaks.length) restarts += ` · ⚠️ **Cache breaks:** ${S.cacheBreaks.length} (${usd(S.cacheBreaks.reduce((a, r) => a + r.usd, 0))}), last: ${S.cacheBreaks[S.cacheBreaks.length - 1].cause}`
   lines.push(restarts)
   lines.push(`- **Cold-send guard:** ${settings.guard ? 'on' : 'off'}, asks above **${bigText()}** · rewriting now ≈ ${usd(rewrite)}, ${isBig() ? 'above' : 'below'} that`)
-  lines.push(`- **Handoff hint:** ${settings.handoffAt ? `from **${tokens(settings.handoffAt)}** tokens${settings.handoffAt === HANDOFF_AT ? ' (default)' : ''}` : 'off'} · a handoff costs about **${usd(keepWarmVsHandoff(0).handoff)}** now (fresh chat ${tokens(S.startTokens || FRESH_START)}${S.startTokens ? '' : ' estimated'}, handoff ${tokens(handoffOut())}${S.handoffOuts.length ? `, average of the last ${S.handoffOuts.length}` : ' estimated'})`)
+  lines.push(`- **Handoff hint:** ${settings.handoffAt ? `from **${tokens(settings.handoffAt)}** tokens${settings.handoffAt === HANDOFF_AT ? ' (default)' : ''}, then every ${tokens(HANDOFF_STEP)} more` : 'off'} · a handoff costs about **${usd(keepWarmVsHandoff(0).handoff)}** now (fresh chat ${tokens(S.startTokens || FRESH_START)}${S.startTokens ? '' : ' estimated'}, handoff ${tokens(handoffOut())}${S.handoffOuts.length ? `, average of the last ${S.handoffOuts.length}` : ' estimated'})`)
   lines.push(`- **Alerts:** ${settings.alerts ? 'on' : 'off'}`)
   lines.push(`- **Settings:** \`/${c} ttl 5|60|auto\` · \`/${c} guard on|off\` · \`/${c} big $1|default\` · \`/${c} handoff 300k|off|default\` · \`/${c} alerts on|off\``)
   return lines.join('\n')
@@ -801,7 +833,7 @@ export function register(on) {
       const n = value === 'default' ? HANDOFF_AT : value === 'off' ? 0 : parseTokens(value)
       if (n === null) return { text: `Usage: \`/${names.cache} handoff 300k\` (a context size in tokens), \`off\`, or \`default\`.` }
       settings.handoffAt = n
-      S.handoffNoted = false
+      S.handoffNextAt = 0
     }
     if (key) {
       await $.store.set('settings', settings)
