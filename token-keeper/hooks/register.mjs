@@ -40,6 +40,8 @@ const S = {
   costUsd: 0,
   ttlMin: 60,
   ttlSource: 'default',
+  ttlWritten: 0, // the TTL of the last main-loop cache write, in minutes (0: none since /cache ttl)
+  ttlWarned: false, // said once that Claude Code does not write the TTL /cache ttl set
   coldRestarts: [],
   working: false,
   turnId: '', // the main loop's running (or last) turn
@@ -64,7 +66,9 @@ let now = 0
 let home = ''
 let warnedFor = 0 // the lastActivity the cooling warning was shown for
 let justCompacted = false
+let ttlSwitched = false // /cache ttl changed while the cache was warm: the next request rewrites
 let handoffPending = false
+let envPrior // CLAUDE_CODE_PROMPT_CACHE_TTL before /cache ttl set it
 
 // The handoff flow. When /session-handoff runs (the band's button, /handoff, a
 // typed command, or Claude calling the skill), the answer of the turn it starts
@@ -225,8 +229,27 @@ async function runHandoff($) {
   }
 }
 
+// What the cache really uses: the last write's TTL, else /cache ttl, else the estimate
 function ttlMin() {
-  return settings.ttlMin || S.ttlMin
+  return S.ttlWritten || settings.ttlMin || S.ttlMin
+}
+
+function ttlEnv(min) {
+  return min === 5 ? '5m' : min === 60 ? '1h' : undefined
+}
+
+// Points Claude Code's own cache TTL at the /cache ttl choice; auto gives the
+// variable back as it was before Token Keeper set it
+async function applyTtl($) {
+  // a refusal must not break /cache: the next write's TTL check reports it
+  await $.env.set('CLAUDE_CODE_PROMPT_CACHE_TTL', settings.ttlMin ? ttlEnv(settings.ttlMin) : envPrior).catch(() => {})
+}
+
+function ttlSourceText() {
+  if (!settings.ttlMin) return S.ttlSource
+  if (!S.ttlWritten) return 'set by you'
+  if (S.ttlWritten === settings.ttlMin) return 'set by you · confirmed'
+  return `⚠️ you set ${settings.ttlMin} min, but Claude Code writes ${S.ttlWritten} min`
 }
 
 function ttlName(ttl) {
@@ -595,7 +618,7 @@ function statusText() {
   const c = names.cache
   // Markdown, as a command's output draws: a bold label per line, the band's icons
   const lines = []
-  lines.push(`**Token Keeper** · ${tokens(S.ctx)} tokens in context on **${modelName(S.model)}** · cache window **${ttl} min** (${settings.ttlMin ? 'set by you' : S.ttlSource})`)
+  lines.push(`**Token Keeper** · ${tokens(S.ctx)} tokens in context on **${modelName(S.model)}** · cache window **${ttl} min** (${ttlSourceText()})`)
   lines.push('')
   if (st.kind === 'unknown') lines.push('- – **Cache:** no request yet this session, so its state is unknown')
   if (st.kind === 'warm') lines.push(`- ● **Cache:** warm for about **${minutes(st.left)}** more`)
@@ -638,6 +661,10 @@ export function register(on) {
     S.cwd = await $.session.cwd()
     S.model = await $.session.model()
     await loadSettings($)
+    // Remember the variable as found, unless it is the value /cache ttl set (a reload)
+    const prior = await $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL')
+    envPrior = settings.ttlMin && prior === ttlEnv(settings.ttlMin) ? undefined : prior
+    if (settings.ttlMin) await applyTtl($)
     const outs = await $.store.get('handoffOuts')
     S.handoffOuts = Array.isArray(outs) ? outs.filter((n) => n > 0).slice(-5) : []
     measureStart($).catch(() => {})
@@ -722,13 +749,29 @@ export function register(on) {
     now = await $.clock.now()
     const total = totalInput(u)
     const written = u.cache_creation_input_tokens || 0
+    // Each write says which TTL it used: the cache window, measured
+    if (u.cache_creation && written > 0) {
+      S.ttlWritten = (u.cache_creation.ephemeral_1h_input_tokens || 0) * 2 >= written ? 60 : 5
+      if (!settings.ttlMin) {
+        S.ttlMin = S.ttlWritten
+        S.ttlSource = 'measured'
+      } else if (S.ttlWritten !== settings.ttlMin && !S.ttlWarned) {
+        S.ttlWarned = true
+        if (settings.alerts) warn($, `You set the ${settings.ttlMin}-min cache TTL, but Claude Code still writes ${S.ttlWritten}-min entries. FORCE_PROMPT_CACHING_5M overrides it, and setting it needs Claude Code v2.1.242 or later.`)
+      }
+    }
     const gap = S.lastActivity ? startedAt - S.lastActivity : 0
     const prevModel = S.model
     S.model = u.model || S.model
     const afterCompact = justCompacted
     justCompacted = false
+    const afterTtlSwitch = ttlSwitched
+    ttlSwitched = false
     if (afterCompact) {
       // the first request after a compaction writes the new, shorter context: expected
+    } else if (afterTtlSwitch) {
+      // a /cache ttl switch while warm: the rewrite is expected, so say what it really cost
+      if (written > 0) note($, `Switching to the ${ttlName(ttlMin())} rewrote ${tokens(written)} tokens for about ${usd(rewriteCost(written, S.model, ttlMin()))}.`)
     } else if (S.lastActivity && total > 30000 && written / total > 0.5 && gap < 4.5 * MIN) {
       // Rewritten although the cache was still warm: something changed the prompt prefix
       const cause = prevModel && u.model && prevModel !== u.model ? `the model changed (${priceFor(prevModel).id} → ${priceFor(u.model).id})` : 'the prompt prefix changed (CLAUDE.md, MCP tools, settings, effort, or system prompt)'
@@ -823,7 +866,26 @@ export function register(on) {
     now = await $.clock.now()
     const [key, value] = String(e.args || '').trim().toLowerCase().split(/\s+/)
     if (key === 'ttl') {
-      settings.ttlMin = value === '5' ? 5 : value === '60' ? 60 : 0
+      const want = value === '5' ? 5 : value === '60' ? 60 : 0
+      // While the cache is warm, the next request rewrites what was cached under
+      // the old TTL; once it is cold that rewrite happens anyway, so no question
+      const st = cacheState()
+      if (want && want !== ttlMin() && ['warm', 'cooling', 'kept'].includes(st.kind) && S.ctx > 30000) {
+        const cost = usd(rewriteCost(S.ctx, S.model, want))
+        const keep = `Keep the ${ttlName(ttlMin())}`
+        let answer = keep
+        try {
+          answer = await $.ui.ask(`The cache is warm. Switching to the ${ttlName(want)} makes your next message rewrite up to ${tokens(S.ctx)} tokens (about ${cost}). Once the cache is cold, switching costs nothing extra. Switch now?`, ['Switch now', keep])
+        } catch {
+          // dismissed, or nobody to ask: keep the TTL
+        }
+        if (answer !== 'Switch now') return { text: `Cache TTL unchanged: ${ttlName(ttlMin())}. Switching now would rewrite up to ${tokens(S.ctx)} tokens (about ${cost}); after the cache goes cold it is free.` }
+      }
+      if (want !== settings.ttlMin && ['warm', 'cooling', 'kept'].includes(st.kind)) ttlSwitched = true
+      settings.ttlMin = want
+      S.ttlWritten = 0
+      S.ttlWarned = false
+      await applyTtl($)
     } else if (key === 'guard' || key === 'alerts') {
       settings[key] = value !== 'off'
     } else if (key === 'big') {
