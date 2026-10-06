@@ -18,6 +18,13 @@ const MAX_READ = 4 * 1024 * 1024 // $.fs.read refuses larger files
 // The default cold-send threshold: below a rewrite of about $1 a dialog
 // bothers more than the rewrite costs (about 125k tokens on Opus 5.5, 1h TTL)
 const BIG_USD = 1
+// What a handoff costs besides one read of the context: its output, and a fresh
+// chat's start (system prompt, tools, memory files). Both are measured; these
+// stand in until they are
+const HANDOFF_OUT = 3000
+const FRESH_START = 20000
+// The default context size from which a handoff is suggested
+const HANDOFF_AT = 300000
 
 // This session
 const S = {
@@ -42,9 +49,12 @@ const S = {
   effort: '',
   todayUsd: null, // every session's spend since local midnight
   todayPartial: false, // a transcript was too big to read, so todayUsd is a lower bound
+  startTokens: 0, // what a fresh chat starts with, as /context counts it (0: not measured)
+  handoffOuts: [], // output tokens of the last few handoffs, kept across sessions
+  handoffNoted: false, // the size notice was shown this session
 }
 
-const settings = { bigUsd: BIG_USD, guard: true, ttlMin: 0, alerts: true }
+const settings = { bigUsd: BIG_USD, guard: true, ttlMin: 0, alerts: true, handoffAt: HANDOFF_AT }
 const names = { cache: 'cache', keepwarm: 'keepwarm', handoff: 'handoff' }
 
 let now = 0
@@ -60,6 +70,7 @@ let handoffPending = false
 const HANDOFF_SKILL = /(^|:)session-handoff$/
 const H = {
   armed: false,
+  outTokens: 0, // output of the handoff turn so far
   notTurn: '', // a turn already running when the handoff was queued: not the handoff's
   askAfter: false, // /handoff asks "clear and continue?" once the handoff is in
   text: '',
@@ -69,6 +80,7 @@ const H = {
 
 function armHandoff(insideTurn) {
   H.armed = true
+  H.outTokens = 0
   H.notTurn = insideTurn ? '' : S.working ? S.turnId : ''
 }
 
@@ -107,6 +119,10 @@ async function captureHandoff($, e) {
     return
   }
   H.text = body
+  if (H.outTokens > 0) {
+    S.handoffOuts = [...S.handoffOuts, H.outTokens].slice(-5)
+    await $.store.set('handoffOuts', S.handoffOuts).catch(() => {})
+  }
   try {
     H.path = await saveHandoff($, body)
   } catch {
@@ -284,6 +300,34 @@ function parseDuration(text) {
   return Math.min(24 * 60 * MIN, ms)
 }
 
+// "300k", "1.5M", "300000"
+function parseTokens(text) {
+  const m = String(text || '').match(/^(\d+(?:\.\d+)?)\s*(k|m)?$/)
+  if (!m || !(Number(m[1]) > 0)) return null
+  return Math.round(Number(m[1]) * (m[2] === 'k' ? 1e3 : m[2] === 'm' ? 1e6 : 1))
+}
+
+// What a fresh chat starts with: every /context row but the messages. A local
+// estimate, no request
+async function measureStart($) {
+  try {
+    const u = await $.session.usage({ breakdown: 'summary' })
+    const rows = (u.context && u.context.breakdown && u.context.breakdown.categories) || []
+    const sum = rows.filter((r) => r.kind === 'used' && r.name !== 'Messages').reduce((a, r) => a + (r.tokens || 0), 0)
+    if (sum > 0) S.startTokens = sum
+  } catch {
+    // no breakdown: keep the last figure or the default
+  }
+}
+
+// Once per session, when the context passes the handoff size
+function handoffStep($) {
+  if (!settings.alerts || !settings.handoffAt || S.handoffNoted || S.ctx < settings.handoffAt) return
+  S.handoffNoted = true
+  const c = keepWarmVsHandoff(0)
+  note($, `This chat is at ${tokens(S.ctx)} tokens, and every turn re-reads all of it (${usd(c.ping)}). A /${names.handoff} or /compact (about ${usd(c.handoff)}, either) carries on with about ${tokens(c.fresh)}: about ${usd(c.perTurn)} less per turn.`)
+}
+
 function parseUsd(text) {
   const m = String(text || '').match(/^\$?(\d+(?:\.\d+)?)$/)
   return m && Number(m[1]) > 0 ? Number(m[1]) : null
@@ -303,6 +347,30 @@ function bolder(md) {
   return md ? (s) => `**${s}**` : (s) => s
 }
 
+// Keep warm for ms vs a handoff now, in dollars. A handoff reads the context
+// once, writes the handoff, and the fresh chat writes its start; then no pings
+// The handoff's output: the average of the last few, or the estimate
+function handoffOut() {
+  return S.handoffOuts.length ? S.handoffOuts.reduce((a, n) => a + n, 0) / S.handoffOuts.length : HANDOFF_OUT
+}
+
+// Keep warm for ms vs a handoff now, in dollars, and what each turn after the
+// handoff saves on re-reading the context (a /compact costs about the same)
+function keepWarmVsHandoff(ms) {
+  const ttl = ttlMin()
+  const p = priceFor(S.model)
+  const ping = S.ctx * p.read / 1e6
+  const start = S.startTokens || FRESH_START
+  const fresh = start + handoffOut()
+  return {
+    ping,
+    fresh,
+    keepWarm: Math.ceil(ms / pingEvery(ttl)) * ping,
+    handoff: ping + handoffOut() * p.output / 1e6 + start * writeRate(S.model, ttl) / 1e6,
+    perTurn: Math.max(0, S.ctx - fresh) * p.read / 1e6,
+  }
+}
+
 // Starts keeping the cache warm and says so, with ⚠️ past the break-even
 function startKeepWarm(ms, isDefault, md) {
   S.keepWarm = true
@@ -313,7 +381,9 @@ function startKeepWarm(ms, isDefault, md) {
   const how = `${b(minutes(ms))}${isDefault ? `, the default on the ${ttlName(ttl)}` : ''}, until ${clock(S.keepWarmUntil)}`
   const on = `On ${modelName(S.model)} with the ${ttlName(ttl)}`
   if (ms > be) return `⚠️ Keeping this cache warm for ${how}. ${on} that only pays off up to ${b('~' + minutes(be))}: after that, one rewrite (${usd(rewriteCost(S.ctx, S.model, ttl))}) is cheaper. Better: ${b(`/${names.keepwarm} ${ttl >= 60 ? '4h' : '30m'}`)} (the default), ${b('/' + names.handoff)} now while the cache is warm, or ${b('/clear')}.`
-  return `ℹ️ Keeping this cache warm for ${how}. ${on} it pays off up to ~${minutes(be)}.`
+  const c = keepWarmVsHandoff(ms)
+  const vs = c.handoff < c.keepWarm ? ` A ${b('/' + names.handoff)} now is cheaper: about ${usd(c.handoff)} vs ${usd(c.keepWarm)} for ${minutes(ms)} of pings. After it, each turn re-reads about ${tokens(c.fresh)} instead of ${tokens(S.ctx)}, about ${usd(c.perTurn)} less.` : ''
+  return `ℹ️ Keeping this cache warm for ${how}. ${on} it pays off up to ~${minutes(be)}.${vs}`
 }
 
 // Stops keeping the cache warm and says so ('' when it was off), ⚠️ for a problem
@@ -506,8 +576,9 @@ function statusText() {
   if (S.cacheBreaks.length) restarts += ` · ⚠️ **Cache breaks:** ${S.cacheBreaks.length} (${usd(S.cacheBreaks.reduce((a, r) => a + r.usd, 0))}), last: ${S.cacheBreaks[S.cacheBreaks.length - 1].cause}`
   lines.push(restarts)
   lines.push(`- **Cold-send guard:** ${settings.guard ? 'on' : 'off'}, asks above **${bigText()}** · rewriting now ≈ ${usd(rewrite)}, ${isBig() ? 'above' : 'below'} that`)
+  lines.push(`- **Handoff hint:** ${settings.handoffAt ? `from **${tokens(settings.handoffAt)}** tokens${settings.handoffAt === HANDOFF_AT ? ' (default)' : ''}` : 'off'} · a handoff costs about **${usd(keepWarmVsHandoff(0).handoff)}** now (fresh chat ${tokens(S.startTokens || FRESH_START)}${S.startTokens ? '' : ' estimated'}, handoff ${tokens(handoffOut())}${S.handoffOuts.length ? `, average of the last ${S.handoffOuts.length}` : ' estimated'})`)
   lines.push(`- **Alerts:** ${settings.alerts ? 'on' : 'off'}`)
-  lines.push(`- **Settings:** \`/${c} ttl 5|60|auto\` · \`/${c} guard on|off\` · \`/${c} big $1|default\` · \`/${c} alerts on|off\``)
+  lines.push(`- **Settings:** \`/${c} ttl 5|60|auto\` · \`/${c} guard on|off\` · \`/${c} big $1|default\` · \`/${c} handoff 300k|off|default\` · \`/${c} alerts on|off\``)
   return lines.join('\n')
 }
 
@@ -534,7 +605,10 @@ export function register(on) {
     S.cwd = await $.session.cwd()
     S.model = await $.session.model()
     await loadSettings($)
-    names.cache = (await registerCommand($, 'cache', 'Token Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big $1|default] [alerts on|off]')) || names.cache
+    const outs = await $.store.get('handoffOuts')
+    S.handoffOuts = Array.isArray(outs) ? outs.filter((n) => n > 0).slice(-5) : []
+    measureStart($).catch(() => {})
+    names.cache = (await registerCommand($, 'cache', 'Token Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big $1|default] [handoff 300k|off|default] [alerts on|off]')) || names.cache
     names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 30m on the 5-min TTL, 4h on the 1h TTL), or /keepwarm off', '[30m|4h|off]', true)) || names.keepwarm
     names.handoff = (await registerCommand($, 'handoff', 'Session handoff, then clear this chat and continue with it (/handoff continue)', '[continue]')) || names.handoff
     $.clock.every(TICK_EVERY, () => tick($).catch(() => {}))
@@ -642,6 +716,7 @@ export function register(on) {
         S.ttlSource = 'measured'
       }
     }
+    if (H.armed) H.outTokens += u.output_tokens || 0
     S.ctx = total
     S.lastActivity = now
     if (e.effort) S.effort = String(e.effort)
@@ -663,6 +738,7 @@ export function register(on) {
       // usage unavailable: keep the per-request figures
     }
     if (H.armed && e.turnId !== H.notTurn) await captureHandoff($, e)
+    else handoffStep($)
     $.ui.invalidate('ui.render')
     return r
   })
@@ -721,6 +797,11 @@ export function register(on) {
       const n = value === 'default' ? BIG_USD : parseUsd(value)
       if (!n) return { text: `Usage: \`/${names.cache} big $1\` (a dollar amount), or \`/${names.cache} big default\`.` }
       settings.bigUsd = n
+    } else if (key === 'handoff') {
+      const n = value === 'default' ? HANDOFF_AT : value === 'off' ? 0 : parseTokens(value)
+      if (n === null) return { text: `Usage: \`/${names.cache} handoff 300k\` (a context size in tokens), \`off\`, or \`default\`.` }
+      settings.handoffAt = n
+      S.handoffNoted = false
     }
     if (key) {
       await $.store.set('settings', settings)
@@ -736,10 +817,12 @@ export function register(on) {
     if (arg === 'off' || (arg === '' && S.keepWarm)) {
       text = stopKeepWarm('turned off') || 'ℹ️ Keep warm is already off.'
     } else if (arg === '') {
+      await measureStart($)
       text = startKeepWarm(defaultKeepWarmMs(), true, true)
     } else {
       const ms = parseDuration(arg)
       if (!ms) return { text: `Usage: \`/${names.keepwarm} 30m\`, \`/${names.keepwarm} 4h\`, or \`/${names.keepwarm} off\`.` }
+      await measureStart($)
       text = startKeepWarm(ms, false, true)
     }
     $.ui.invalidate('ui.render')

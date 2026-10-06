@@ -1,5 +1,10 @@
 # Changes
 
+## 1.1.0 (2026-10-06)
+- `/keepwarm` says when a `/handoff` now is cheaper than the pings it would send, with both prices, and how much less each turn after it costs.
+- A handoff's cost is measured: the fresh chat's start from /context (system prompt, tools, MCP tools, memory files), and the average output of the last five handoffs.
+- A notice suggests `/handoff` or `/compact` once a chat passes `/cache handoff` tokens (300k by default, or off), with what each turn would save.
+
 ## 1.0.0 (2026-10-06)
 - First release. Forked from Cache Keeper 1.0.0 by Nate Herk (nateherkai/claude-code-mods), cut down to four jobs: stats, cache settings, keep warm, handoff.
 - Cache-break detector: a rewrite while the cache was warm, with the suspected cause.
