@@ -80,7 +80,7 @@ test('past the handoff size, a notice suggests /handoff, again 100k later', asyn
   }
   const hint = logs.filter((l) => l.includes('This chat is at 310k tokens'))
   expect(hint.length).toBe(1)
-  expect(hint[0]).toContain('re-reads all of it ($0.06), and a long context gets less reliable. A /handoff or /compact (about $0.28, either) carries on with about 23.0k: about $0.06 less per turn.')
+  expect(hint[0]).toContain('This chat is at 310k tokens, and a long context gets less reliable. A /handoff or /compact (about $0.28, either) carries on in a fresh chat, and every turn after it re-reads about 23.0k instead of 310k: $0.06 less per turn.')
   // the next reminder comes 100k later
   ctx = 405000
   for await (const _ of $.turn.step({ turnId: 't3', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as any) as any) {}
@@ -157,4 +157,101 @@ test('after a /cache ttl switch while warm, the rewrite is reported with its rea
   // 30k written at the 5-min write price ($5/M on Opus 5.5)
   expect(logs).toContain('ℹ️ Switching to the 5-min TTL rewrote 30.0k tokens for about $0.15.')
   expect(logs.some((l) => l.includes('Cache broken'))).toBe(false)
+})
+
+test('without a 1h/5m split in the usage, the TTL comes from what Claude Code charged', async ($, on) => {
+  mock.store(on)
+  mock.clock(on, { now: Date.parse('2026-10-05T12:00:00Z') })
+  // Sonnet 5.5: 25.5k read at $0.20/M, 8.3k written at the 1h price ($4/M), as the session's cost counts it
+  let usd = 0
+  const usage = { model: 'claude-sonnet-5-5', input_tokens: 2, cache_read_input_tokens: 25527, cache_creation_input_tokens: 8288, output_tokens: 4 }
+  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 33800, window: 1000000 }, rateLimits: [], cost: { usd } } }) as any)
+  on('turn.step', async function* (_$, e) {
+    usd += 0.0383014
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], usage } as any
+  })
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-sonnet-5-5', messageCount: 1 } as any) as any) {}
+  expect((await $.command.run({ command: 'cache', args: '' })).text).toContain('cache window **60 min** (measured)')
+})
+
+test('the handoff notice names no saving when the fresh chat would not be smaller', async ($, on) => {
+  mock.store(on)
+  mock.clock(on, { now: Date.parse('2026-10-05T12:00:00Z') })
+  const logs: string[] = []
+  on('ui.log', (_$, e: any) => { logs.push(String(e.text ?? e)); return { value: {} } as any })
+  on('turn.complete', () => ({ text: '' }) as any)
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], usage: { model: 'claude-opus-5-5', input_tokens: 10, cache_read_input_tokens: 36000, cache_creation_input_tokens: 0, output_tokens: 100 } } as any
+  })
+  await $.command.run({ command: 'cache', args: 'handoff 30k' })
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as any) as any) {}
+  await $.turn.complete({ turnId: 't1', reason: 'answer', answer: 'ok' } as any)
+  const hint = logs.find((l) => l.includes('This chat is at '))
+  expect(hint).toContain('a long context gets less reliable. A /handoff or /compact (about')
+  expect(hint).toContain('carries on in a fresh chat.')
+  expect(hint).not.toContain('less per turn')
+})
+
+test('on the 5-min TTL the cache counts as cooling only from the ping time, not right after a turn', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on, { now: Date.parse('2026-10-05T12:00:00Z') })
+  on('env.set', () => ({ value: undefined }) as any)
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], usage: { model: 'claude-opus-5-5', input_tokens: 10, cache_read_input_tokens: 36000, cache_creation_input_tokens: 2000, cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 2000 }, output_tokens: 100 } } as any
+  })
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as any) as any) {}
+  expect((await $.command.run({ command: 'cache', args: '' })).text).toContain('- ● **Cache:** warm for about **5m** more')
+  await clock.advance(4 * 60 * 1000)
+  expect((await $.command.run({ command: 'cache', args: '' })).text).toContain('- ◐ **Cache:** ⚠️ cools in **1m**')
+})
+
+test('keep warm survives the first ping writing the turn\'s tail, and stops when a later ping misses', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on, { now: Date.parse('2026-10-05T12:00:00Z') })
+  const logs: string[] = []
+  on('ui.log', (_$, e: any) => { logs.push(String(e.text ?? e)); return { value: {} } as any })
+  on('env.set', () => ({ value: undefined }) as any)
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], usage: { model: 'claude-opus-5-5', input_tokens: 10, cache_read_input_tokens: 25000, cache_creation_input_tokens: 9000, cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 9000 }, output_tokens: 100 } } as any
+  })
+  // ping 1 writes the tail, ping 2 reads, ping 3 writes again: a miss
+  const pings = [{ r: 25000, w: 9000 }, { r: 34000, w: 0 }, { r: 25000, w: 9000 }]
+  let n = 0
+  on('model.fork', () => { const p = pings[Math.min(n++, 2)]; return { value: { isAnswered: true, text: 'ok', usage: { input_tokens: 27, output_tokens: 4, cache_read_input_tokens: p.r, cache_creation_input_tokens: p.w } } } as any })
+  mock.env(on, {})
+  on('session.id', () => ({ value: 's1' }) as any)
+  on('session.cwd', () => ({ value: 'D:/project' }) as any)
+  on('session.model', () => ({ value: 'claude-opus-5-5' }) as any)
+  on('command.register', () => ({ value: undefined }) as any)
+  on('session.start', async (_$, e, next) => { try { return await next(e) } catch { return {} as any } })
+  await $.session.start({ source: 'startup' } as any).catch(() => {})
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as any) as any) {}
+  await $.command.run({ command: 'keepwarm', args: '30m' })
+  await clock.advance(4 * 60 * 1000)
+  expect(n).toBe(1)
+  expect(logs.some((l) => l.includes('Keep warm off'))).toBe(false)
+  await clock.advance(4 * 60 * 1000)
+  expect(n).toBe(2)
+  await clock.advance(4 * 60 * 1000)
+  expect(n).toBe(3)
+  expect(logs.some((l) => l.includes('Keep warm off (the ping wrote 9.0k tokens instead of reading the cache)'))).toBe(true)
+})
+
+test('a return past the TTL counts as a cold restart even when the system prompt part stayed warm', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on, { now: Date.parse('2026-10-05T12:00:00Z') })
+  on('env.set', () => ({ value: undefined }) as any)
+  let usage: any = { model: 'claude-sonnet-5-5', input_tokens: 2, cache_read_input_tokens: 25527, cache_creation_input_tokens: 10891, cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 10891 }, output_tokens: 4 }
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], usage } as any
+  })
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-sonnet-5-5', messageCount: 1 } as any) as any) {}
+  await clock.advance(7 * 60 * 1000)
+  // what the live test saw: 25.5k read (system prompt), 11.7k written (31%)
+  usage = { ...usage, cache_creation_input_tokens: 11674, cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 11674 } }
+  for await (const _ of $.turn.step({ turnId: 't2', index: 0, model: 'claude-sonnet-5-5', messageCount: 1 } as any) as any) {}
+  expect((await $.command.run({ command: 'cache', args: '' })).text).toContain('- **Cold restarts:** 1 (')
 })

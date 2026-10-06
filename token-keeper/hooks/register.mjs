@@ -49,6 +49,7 @@ const S = {
   keepWarmUntil: 0,
   pings: 0,
   pingUsd: 0,
+  pingsSinceTurn: 0, // keep-warm pings since the last main-loop request
   rateLimits: [],
   cacheBreaks: [], // rewrites while the cache was still warm
   effort: '',
@@ -234,6 +235,28 @@ function ttlMin() {
   return S.ttlWritten || settings.ttlMin || S.ttlMin
 }
 
+// The session's spend as Claude Code counts it, or null when it does not say
+async function sessionUsd($) {
+  try {
+    const cost = (await $.session.usage()).cost
+    return cost ? cost.usd : null
+  } catch {
+    return null
+  }
+}
+
+// The TTL a cache write used: the usage's 1h/5m split when it has one; else the
+// price that matches what Claude Code charged for the request, since its cost
+// counts the TTL really written (0: too small to tell, or another request in between)
+function writeTtl(u, written, charged) {
+  if (u.cache_creation && written > 0) return (u.cache_creation.ephemeral_1h_input_tokens || 0) * 2 >= written ? 60 : 5
+  if (charged === null || written < 1000) return 0
+  const p5 = requestCost(u, u.model || S.model, 5)
+  const p60 = requestCost(u, u.model || S.model, 60)
+  const near = Math.abs(charged - p60) < Math.abs(charged - p5) ? 60 : 5
+  return Math.abs(charged - (near === 60 ? p60 : p5)) < Math.abs(p60 - p5) / 4 ? near : 0
+}
+
 function ttlEnv(min) {
   return min === 5 ? '5m' : min === 60 ? '1h' : undefined
 }
@@ -286,7 +309,10 @@ function cacheState() {
   if (left === null) return { kind: 'unknown', left: 0 }
   if (S.keepWarm) return { kind: 'kept', left }
   if (left <= 0) return { kind: 'cold', left }
-  if (left <= 5 * MIN) return { kind: 'cooling', left }
+  // Cooling: from when a keep-warm ping would go out (5 minutes before on the 1h
+  // TTL, 90s on the 5-minute one), so a 5-minute cache is not cooling right away
+  const ttl = ttlMin()
+  if (left <= Math.min(5 * MIN, ttl * MIN - pingEvery(ttl))) return { kind: 'cooling', left }
   return { kind: 'warm', left }
 }
 
@@ -356,7 +382,9 @@ function handoffStep($) {
   while (next <= S.ctx) next += HANDOFF_STEP
   S.handoffNextAt = next
   const c = keepWarmVsHandoff(0)
-  note($, `This chat is at ${tokens(S.ctx)} tokens: every turn re-reads all of it (${usd(c.ping)}), and a long context gets less reliable. A /${names.handoff} or /compact (about ${usd(c.handoff)}, either) carries on with about ${tokens(c.fresh)}: about ${usd(c.perTurn)} less per turn.`)
+  // Quality is the reason; the saving is named only when the fresh chat is clearly smaller
+  const saves = c.perTurn >= 0.01 ? `, and every turn after it re-reads about ${tokens(c.fresh)} instead of ${tokens(S.ctx)}: ${usd(c.perTurn)} less per turn` : ''
+  note($, `This chat is at ${tokens(S.ctx)} tokens, and a long context gets less reliable. A /${names.handoff} or /compact (about ${usd(c.handoff)}, either) carries on in a fresh chat${saves}.`)
   // Off the hook: the turn is ending, and a dialog would hold it open
   $.clock.after(300, () => offerHandoff($, next).catch(() => {}))
 }
@@ -459,6 +487,9 @@ async function keepWarmStep($) {
   if (S.working || !S.lastActivity) return
   const ttl = ttlMin()
   if (now - S.lastActivity < pingEvery(ttl)) return
+  // Past the TTL the cache is gone (keep warm started late, or the machine slept):
+  // a ping would only write it again
+  if (now - S.lastActivity >= ttl * MIN) return log($, stopKeepWarm(`the cache already went cold ${minutes(now - S.lastActivity - ttl * MIN)} ago, so a ping would only write it again`, true))
   let reply = null
   try {
     reply = await $.model.fork({ prompt: 'token-keeper keep-alive ping. Reply with only: ok' })
@@ -473,8 +504,12 @@ async function keepWarmStep($) {
   S.pings += 1
   S.pingUsd += cost
   addToday(cost)
-  // A ping that writes instead of reading did not hit the cache: stop paying for it
-  if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
+  // The first ping after a turn may write the turn's tail (its prefix ends after the
+  // reply, the main thread's entry before it); a later ping that writes much missed
+  // the cache: stop paying for it
+  const first = S.pingsSinceTurn === 0
+  S.pingsSinceTurn += 1
+  if (!first && (u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
     return log($, stopKeepWarm(`the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`, true))
   }
   S.lastActivity = now
@@ -741,6 +776,7 @@ export function register(on) {
   // cache or rewrite it?
   on('turn.step', async function* ($, e, next) {
     const startedAt = await $.clock.now()
+    const usdBefore = e.agentId ? null : await sessionUsd($)
     const result = yield* next(e)
     if (!result || !result.usage) return result
     const u = result.usage
@@ -749,9 +785,11 @@ export function register(on) {
     now = await $.clock.now()
     const total = totalInput(u)
     const written = u.cache_creation_input_tokens || 0
-    // Each write says which TTL it used: the cache window, measured
-    if (u.cache_creation && written > 0) {
-      S.ttlWritten = (u.cache_creation.ephemeral_1h_input_tokens || 0) * 2 >= written ? 60 : 5
+    // Each write's TTL is the cache window, measured
+    const usdAfter = usdBefore === null ? null : await sessionUsd($)
+    const seen = writeTtl(u, written, usdAfter === null ? null : usdAfter - usdBefore)
+    if (seen) {
+      S.ttlWritten = seen
       if (!settings.ttlMin) {
         S.ttlMin = S.ttlWritten
         S.ttlSource = 'measured'
@@ -778,7 +816,9 @@ export function register(on) {
       const cost = rewriteCost(written, S.model, ttlMin())
       S.cacheBreaks.push({ at: now, tokens: written, usd: cost, cause })
       if (settings.alerts) warn($, `Cache broken while warm: ${cause}. Rewrote ${tokens(written)} tokens for about ${usd(cost)}.`)
-    } else if (S.lastActivity && total > 30000 && written / total > 0.5) {
+    } else if (S.lastActivity && total > 30000 && (written / total > 0.5 || (gap >= ttlMin() * MIN && written / total > 0.2))) {
+      // Cold: most of it rewritten, or past the TTL with a big share rewritten (the system
+      // prompt part often stays warm through other sessions, so the share can stay small).
       // A rewrite after 5-60 idle minutes means this session runs on the 5-minute TTL
       if (!settings.ttlMin && gap > 5.5 * MIN && gap < S.ttlMin * MIN) {
         S.ttlMin = 5
@@ -795,6 +835,7 @@ export function register(on) {
     if (H.armed) H.outTokens += u.output_tokens || 0
     S.ctx = total
     S.lastActivity = now
+    S.pingsSinceTurn = 0
     if (e.effort) S.effort = String(e.effort)
     return result
   })
