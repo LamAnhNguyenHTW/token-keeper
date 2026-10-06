@@ -9,6 +9,7 @@
 - Fix: keep warm stopped after its first ping. That ping may write the turn's tail, because a fork's prefix ends after the reply and the main thread's entry before it; it was taken for a cold cache. Now only a later ping that writes much stops keep warm, and a cache already past its TTL is not pinged at all. Measured live: with pings every 3.5 minutes, the main thread read its whole context after an 8-minute pause on the 5-minute TTL.
 - Fix: on the 5-minute TTL the cache counted as cooling right after every turn, so the cooling warning came after every turn. Cooling now starts when a keep-warm ping would go out (90 seconds before on the 5-minute TTL, 5 minutes before on the 1-hour one).
 - Fix: a return past the TTL counts as a cold restart when a fifth or more is rewritten; before it took half, and the system prompt part often stays warm through other sessions.
+- Fix: a big new tool result (a file read) was reported as "Cache broken while warm". Cache breaks and cold restarts now count what the request did not read of the previous request's context, not how much it wrote.
 - The handoff notice leads with quality ("a long context gets less reliable") and names a per-turn saving only when the fresh chat is clearly smaller.
 
 ## 1.1.0 (2026-10-06)

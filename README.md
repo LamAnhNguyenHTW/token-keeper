@@ -16,6 +16,40 @@ All of Cache Keeper's original work is Nate Herk's: the warm/cold cache band, `/
 - **A handoff while the cache is warm.** On a cold cache, writing a handoff rewrites the whole context too. So the cooling warning offers `/handoff` before the cache goes cold.
 - **Today's cost across sessions.** A cache file per day keeps what each transcript cost, so only transcripts that changed are read again, and this session counts live. A transcript too big to read shows as `≥` instead of being left out without a word.
 
+## Where it shows
+
+Token Keeper runs wherever Claude Code runs, but each app draws a different part of it. Claude Code decides which parts each app gets, not the mod.
+
+### Terminal (CLI): everything
+
+![Token Keeper's band above the prompt in the Claude Code terminal](docs/screenshots/cli.png)
+
+The band above the prompt shows the cache state (warm, cooling, cold, kept warm), the context size, what a rewrite costs, rate limits, cold restarts and cache breaks. While a big cache is cooling, it shows a **keep warm** button you press with `1`.
+
+### Claude Code Desktop: band and footer
+
+![Token Keeper in the Claude Code Desktop app](docs/screenshots/desktop.png)
+
+The Desktop app draws the band too, with its buttons as native buttons. The footer also gets a short label, but only when there is something to act on.
+
+### VS Code: commands only, no band
+
+![Token Keeper in the Claude Code extension for VS Code](docs/screenshots/vscode.png)
+
+The VS Code extension does not draw the band, the footer label or the hint line under the prompt; Claude Code gives mods no place there. What still works:
+
+- `/cache`, `/keepwarm` and `/handoff`, with their full text output.
+- Questions in Claude Code's own dialog: the cold-send guard, `/cache ttl` while the cache is warm, and the handoff reminder.
+- Keep-warm pings and cost tracking, which run in the background on every app.
+
+What you miss in VS Code:
+
+- No live cache state. Type `/cache` to see whether the cache is warm and what a rewrite costs.
+- No **keep warm** button and no hotkey `1`. Type `/keepwarm` instead.
+- After `/handoff`, type `/handoff continue` to clear the chat and continue with the handoff.
+
+If you want the band, run `claude` in VS Code's integrated terminal instead of the extension's panel.
+
 ## Install
 
 Needs Claude Code 2.1.287 or later, with mods turned on for your account.

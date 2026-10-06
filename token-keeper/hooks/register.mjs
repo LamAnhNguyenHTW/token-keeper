@@ -36,6 +36,7 @@ const S = {
   model: '',
   lastActivity: 0, // last main-loop request or keep-warm ping that touched the cache
   ctx: 0,
+  lastTotal: 0, // the last main-loop request's prompt size, what its cache entry holds
   window: 0,
   costUsd: 0,
   ttlMin: 60,
@@ -805,26 +806,31 @@ export function register(on) {
     justCompacted = false
     const afterTtlSwitch = ttlSwitched
     ttlSwitched = false
+    // What the cache lost: the part of the previous context this request did not read.
+    // New content (a file read, a tool result) is written too, but that is no loss
+    // (against the last request's own size: S.ctx may already count the new content)
+    const lost = Math.max(0, S.lastTotal - (u.cache_read_input_tokens || 0))
+    const lostMuch = S.lastActivity && S.lastTotal > 30000 && lost > 0.2 * S.lastTotal
     if (afterCompact) {
       // the first request after a compaction writes the new, shorter context: expected
     } else if (afterTtlSwitch) {
       // a /cache ttl switch while warm: the rewrite is expected, so say what it really cost
       if (written > 0) note($, `Switching to the ${ttlName(ttlMin())} rewrote ${tokens(written)} tokens for about ${usd(rewriteCost(written, S.model, ttlMin()))}.`)
-    } else if (S.lastActivity && total > 30000 && written / total > 0.5 && gap < 4.5 * MIN) {
-      // Rewritten although the cache was still warm: something changed the prompt prefix
+    } else if (lostMuch && gap < 4.5 * MIN) {
+      // Lost although the cache was still warm: something changed the prompt prefix
       const cause = prevModel && u.model && prevModel !== u.model ? `the model changed (${priceFor(prevModel).id} → ${priceFor(u.model).id})` : 'the prompt prefix changed (CLAUDE.md, MCP tools, settings, effort, or system prompt)'
-      const cost = rewriteCost(written, S.model, ttlMin())
-      S.cacheBreaks.push({ at: now, tokens: written, usd: cost, cause })
-      if (settings.alerts) warn($, `Cache broken while warm: ${cause}. Rewrote ${tokens(written)} tokens for about ${usd(cost)}.`)
-    } else if (S.lastActivity && total > 30000 && (written / total > 0.5 || (gap >= ttlMin() * MIN && written / total > 0.2))) {
-      // Cold: most of it rewritten, or past the TTL with a big share rewritten (the system
-      // prompt part often stays warm through other sessions, so the share can stay small).
+      const cost = rewriteCost(lost, S.model, ttlMin())
+      S.cacheBreaks.push({ at: now, tokens: lost, usd: cost, cause })
+      if (settings.alerts) warn($, `Cache broken while warm: ${cause}. Rewrote ${tokens(lost)} tokens for about ${usd(cost)}.`)
+    } else if (lostMuch) {
+      // Cold: a fifth or more of the previous context was not read after a pause (the
+      // system prompt part often stays warm through other sessions).
       // A rewrite after 5-60 idle minutes means this session runs on the 5-minute TTL
       if (!settings.ttlMin && gap > 5.5 * MIN && gap < S.ttlMin * MIN) {
         S.ttlMin = 5
         S.ttlSource = 'measured'
       }
-      S.coldRestarts.push({ at: now, tokens: written, usd: rewriteCost(written, S.model, ttlMin()), gapMin: Math.round(gap / MIN) })
+      S.coldRestarts.push({ at: now, tokens: lost, usd: rewriteCost(lost, S.model, ttlMin()), gapMin: Math.round(gap / MIN) })
     } else if (S.lastActivity && total > 30000 && gap > 5.5 * MIN && cachedShare(u) > 0.8) {
       // A hit after more than 5 idle minutes proves the 1-hour TTL
       if (!settings.ttlMin) {
@@ -834,6 +840,7 @@ export function register(on) {
     }
     if (H.armed) H.outTokens += u.output_tokens || 0
     S.ctx = total
+    S.lastTotal = total
     S.lastActivity = now
     S.pingsSinceTurn = 0
     if (e.effort) S.effort = String(e.effort)
