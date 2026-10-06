@@ -49,8 +49,8 @@ test('/keepwarm offers a handoff when that is cheaper than the pings', async ($,
   for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as any) as any) {}
   await $.command.run({ command: 'cache', args: 'ttl 5' })
   const r = await $.command.run({ command: 'keepwarm', args: '' })
-  // 300k read $0.06 + 3k handoff $0.06 + 30k fresh start $0.15 vs 9 pings of $0.06
-  expect(r.text).toContain('A **/handoff** now is cheaper: about $0.27 vs $0.54 for 30m of pings. After it, each turn re-reads about 33.0k instead of 300k, about $0.05 less.')
+  // 300k read $0.06 + 3k handoff $0.06 + 30k fresh start $0.15 vs 8 pings of $0.06
+  expect(r.text).toContain('A **/handoff** now is cheaper: about $0.27 vs $0.48 for 30m of pings. After it, each turn re-reads about 33.0k instead of 300k, about $0.05 less.')
   const shown = await $.command.run({ command: 'cache', args: '' })
   expect(shown.text).toContain('**Handoff hint:** from **140k** tokens (default)')
   expect(shown.text).toContain('fresh chat 30.0k, handoff 3.0k estimated')

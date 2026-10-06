@@ -393,7 +393,7 @@ function keepWarmVsHandoff(ms) {
   return {
     ping,
     fresh,
-    keepWarm: Math.ceil(ms / pingEvery(ttl)) * ping,
+    keepWarm: Math.floor(ms / pingEvery(ttl)) * ping, // a ping every pingEvery, none at the start
     handoff: ping + handoffOut() * p.output / 1e6 + start * writeRate(S.model, ttl) / 1e6,
     perTurn: Math.max(0, S.ctx - fresh) * p.read / 1e6,
   }
