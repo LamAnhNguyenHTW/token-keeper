@@ -44,7 +44,7 @@ The VS Code extension does not draw the band, the footer label or the hint line 
 
 What you miss in VS Code:
 
-- No live cache state. Type `/cache` to see whether the cache is warm and what a rewrite costs.
+- No live cache state. Type `/cache`: it shows everything the band does, including the context against the window, the effort and what a rewrite costs.
 - No **keep warm** button and no hotkey `1`. Type `/keepwarm` instead.
 - After `/handoff`, type `/handoff continue` to clear the chat and continue with the handoff.
 

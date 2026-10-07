@@ -277,3 +277,17 @@ test('a big new tool result is no cache break, a lost prefix while warm is', asy
   for await (const _ of $.turn.step({ turnId: 't2', index: 0, model: 'claude-sonnet-5-5', messageCount: 5 } as any) as any) {}
   expect(logs.some((l) => l.includes('Cache broken while warm: the prompt prefix changed') && l.includes('Rewrote 95.4k tokens'))).toBe(true)
 })
+
+test('/cache shows what the band shows: context of the window, effort and the rewrite price', async ($, on) => {
+  mock.store(on)
+  mock.clock(on, { now: Date.parse('2026-10-05T12:00:00Z') })
+  on('session.measure', () => ({ changed: [] }) as any)
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], usage: { model: 'claude-opus-5-5', input_tokens: 10, cache_read_input_tokens: 309000, cache_creation_input_tokens: 0, output_tokens: 100 } } as any
+  })
+  for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', effort: 'medium', messageCount: 1 } as any) as any) {}
+  await $.session.measure({ context: { tokens: 309000, window: 1000000 }, rateLimits: [], changed: [] } as any)
+  const r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toContain('- **Context:** **309k** / 1.0M (30%) tokens on **Opus 5.5** · medium')
+  expect(r.text).toMatch(/- ● \*\*Cache:\*\* warm for about \*\*\d+m\*\* more · a rewrite would cost about \$\d+\.\d\d/)
+})
