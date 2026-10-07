@@ -1,6 +1,10 @@
 # Changes
 
-## Unreleased
+## 1.3.1
+- `/cache` shows everything the band shows, since VS Code draws no band: the context against the window (`309k / 1.0M (30%)`), the effort, the rewrite price in every cache state, and "Handoff ready" with `/handoff continue` once a handoff is in.
+- Fix: the cold-send guard's "Compact first, then send" never compacted. Claude Code refuses a compaction from inside the prompt hook, and the message went out uncompacted. Now the guard holds the message, compacts, then sends it. If compacting fails, or the message had pasted images or @file mentions (a plugin can't send those again), it goes back into the prompt box unsent.
+
+## 1.3.0
 - `/cache ttl 5|60` sets Claude Code's own cache TTL (`CLAUDE_CODE_PROMPT_CACHE_TTL`), from the next request on and again at each session start; `/cache ttl auto` gives the variable back. Before, it only changed what Token Keeper assumed.
 - The cache window is measured from each cache write (`ephemeral_1h` vs `ephemeral_5m`), and `/cache` says whether the TTL you set is confirmed. A line warns once when Claude Code writes another TTL than the one you set.
 - `/cache ttl` asks first while the cache is warm and the context is over 30k tokens: the switch makes the next message rewrite it, with the price. Once the cache is cold it switches without asking, since that rewrite happens anyway.

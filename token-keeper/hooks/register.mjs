@@ -652,14 +652,20 @@ function statusText() {
   const ttl = ttlMin()
   const rewrite = rewriteCost(S.ctx, S.model, ttl)
   const c = names.cache
-  // Markdown, as a command's output draws: a bold label per line, the band's icons
+  // Markdown, as a command's output draws: a bold label per line, the band's icons.
+  // Everything the band shows is here too: VS Code draws no band, only this.
   const lines = []
-  lines.push(`**Token Keeper** · ${tokens(S.ctx)} tokens in context on **${modelName(S.model)}** · cache window **${ttl} min** (${ttlSourceText()})`)
+  lines.push(`**Token Keeper** · cache window **${ttl} min** (${ttlSourceText()})`)
   lines.push('')
+  const pct = S.window ? Math.floor((S.ctx / S.window) * 100) : null
+  const full = pct >= 80 ? '⚠️ ' : ''
+  lines.push(`- **Context:** ${full}**${tokens(S.ctx)}**${pct === null ? '' : ` / ${tokens(S.window)} (${pct}%)`} tokens on **${modelName(S.model)}**${S.effort ? ` · ${S.effort}` : ''}`)
   if (st.kind === 'unknown') lines.push('- – **Cache:** no request yet this session, so its state is unknown')
-  if (st.kind === 'warm') lines.push(`- ● **Cache:** warm for about **${minutes(st.left)}** more`)
-  if (st.kind === 'cooling') lines.push(`- ◐ **Cache:** ⚠️ cools in **${minutes(st.left)}**`)
+  if (st.kind === 'warm') lines.push(`- ● **Cache:** warm for about **${minutes(st.left)}** more · a rewrite would cost about ${usd(rewrite)}`)
+  if (st.kind === 'kept') lines.push(`- ● **Cache:** kept warm (see below) · a rewrite would cost about ${usd(rewrite)}`)
+  if (st.kind === 'cooling') lines.push(`- ◐ **Cache:** ⚠️ cools in **${minutes(st.left)}**, then the next message rewrites it for about **${usd(rewrite)}**`)
   if (st.kind === 'cold') lines.push(`- ○ **Cache:** ⚠️ cold for ${minutes(-st.left)}, the next message rewrites it for about **${usd(rewrite)}**`)
+  if (H.text) lines.push(`- ✅ **Handoff ready:** \`/${names.handoff} continue\` clears this chat and carries on with it`)
   if (S.keepWarm) lines.push(`- ◆ **Keep warm:** on until **${clock(S.keepWarmUntil)}**, ${S.pings} ping(s), ${usd(S.pingUsd)} so far`)
   else lines.push(`- ◆ **Keep warm:** ${minutes(defaultKeepWarmMs())} by default on the ${ttlName(ttl)}, pays off up to **~${minutes(breakEvenMs())}** on ${modelName(S.model)}`)
   if (S.rateLimits.length) lines.push(`- **Plan limits:** ${S.rateLimits.some((l) => (l.percentUsed || 0) >= 80) ? '⚠️ ' : ''}${limitsText(S.rateLimits)}`)
@@ -687,6 +693,29 @@ async function registerCommand($, name, description, argumentHint, immediate) {
       return null
     }
   }
+}
+
+// The guard's "Compact first, then send", after its prompt.submit hook dropped
+// the message. Whatever fails, the message goes back in the prompt box unsent.
+async function compactThenSend($, held) {
+  let why = ''
+  try {
+    const r = await $.session.compact()
+    if (r && r.skip) why = r.skip
+  } catch (err) {
+    why = String((err && err.message) || err || 'it was refused')
+  }
+  if (why) {
+    log($, `guard: compact failed: ${why}`)
+    await $.prompt.fill({ text: held.text })
+    return warn($, `Not sent: compacting didn't work (${why}). Your message is back in the prompt box.`)
+  }
+  // Pasted images and @file mentions can't be sent again by a plugin
+  if (held.attached) {
+    await $.prompt.fill({ text: held.text })
+    return note($, 'Compacted. Your message is back in the prompt box: attach any images again, then send it.')
+  }
+  await $.prompt.submit({ text: held.text, asUser: true })
 }
 
 export function register(on) {
@@ -754,12 +783,14 @@ export function register(on) {
       return next(e)
     }
     if (answer === 'Compact first, then send') {
-      try {
-        await $.session.compact()
-      } catch {
-        // compaction refused or failed: send anyway
-      }
-      return next(e)
+      // Claude Code refuses compact() from a prompt.submit hook (it would
+      // compact under the turn this hook holds): hold the message, compact
+      // once this hook has returned, then send it
+      // A plugin's prompt expands no pasted images and no @file mentions
+      const attached = !!(e.attachments && e.attachments.length) || /(^|\s)@\S/.test(e.text)
+      const held = { text: e.text, attached }
+      $.clock.after(0, () => { compactThenSend($, held).catch(() => {}) })
+      return { drop: 'Held by token-keeper: compacting first, then sending it' }
     }
     if (answer === 'Send anyway') return next(e)
     // A handoff now would rewrite the cache too: it only saves while warm
